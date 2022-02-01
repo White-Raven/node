@@ -161,11 +161,12 @@ func (k *Keeper) fetchIdentities() []stateEvent.Identity {
 		}
 
 		earnings := k.deps.EarningsProvider.GetEarnings(k.deps.ChainID, id)
+		balance := k.deps.BalanceProvider.GetBalance(k.deps.ChainID, id)
 		stateIdentity := event.Identity{
 			Address:            id.Address,
 			RegistrationStatus: status,
 			ChannelAddress:     channelAddress,
-			Balance:            k.deps.BalanceProvider.GetBalance(k.deps.ChainID, id),
+			Balance:            balance.String(),
 			Earnings:           earnings.UnsettledBalance,
 			EarningsTotal:      earnings.LifetimeBalance,
 			HermesID:           hermesID,
@@ -453,7 +454,13 @@ func (k *Keeper) consumeBalanceChangedEvent(e interface{}) {
 		log.Warn().Msgf("Couldn't find a matching identity for balance change: %s", evt.Identity.Address)
 		return
 	}
-	id.Balance = evt.Current
+
+	if evt.Current != nil {
+		id.Balance = evt.Current.String()
+	} else {
+		id.Balance = "0"
+	}
+
 	go k.announceStateChanges(nil)
 }
 

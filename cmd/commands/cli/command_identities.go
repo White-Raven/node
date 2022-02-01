@@ -159,7 +159,7 @@ func (c *cliApp) getIdentity(actionArgs []string) (err error) {
 	}
 	clio.Info("Registration Status:", identityStatus.RegistrationStatus)
 	clio.Info("Channel address:", identityStatus.ChannelAddress)
-	clio.Info(fmt.Sprintf("Balance: %s", money.New(identityStatus.Balance)))
+	clio.Info(fmt.Sprintf("Balance: %s", money.NewString(identityStatus.Balance)))
 	clio.Info(fmt.Sprintf("Earnings: %s", money.New(identityStatus.Earnings)))
 	clio.Info(fmt.Sprintf("Earnings total: %s", money.New(identityStatus.EarningsTotal)))
 	return nil

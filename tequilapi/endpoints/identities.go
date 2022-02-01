@@ -369,13 +369,17 @@ func (ia *identitiesAPI) Get(c *gin.Context) {
 		stake = data.Stake
 	}
 
-	balance := ia.balanceProvider.GetBalance(chainID, id)
+	balanceString := "0"
+	if balance := ia.balanceProvider.GetBalance(chainID, id); balance != nil {
+		balanceString = balance.String()
+	}
+
 	settlement := ia.earningsProvider.GetEarnings(chainID, id)
 	status := contract.IdentityDTO{
 		Address:            address,
 		RegistrationStatus: regStatus.String(),
 		ChannelAddress:     channelAddress.Hex(),
-		Balance:            balance,
+		Balance:            balanceString,
 		Earnings:           settlement.UnsettledBalance,
 		EarningsTotal:      settlement.LifetimeBalance,
 		Stake:              stake,

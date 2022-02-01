@@ -427,7 +427,7 @@ func Test_ConsumesBalanceChangeEvent(t *testing.T) {
 	keeper := NewKeeper(deps, time.Millisecond)
 	err := keeper.Subscribe(eventBus)
 	assert.NoError(t, err)
-	assert.Zero(t, keeper.GetState().Identities[0].Balance.Uint64())
+	assert.Equal(t, "0", keeper.GetState().Identities[0].Balance)
 
 	// when
 	eventBus.Publish(pingpongEvent.AppTopicBalanceChanged, pingpongEvent.AppEventBalanceChanged{
@@ -438,7 +438,7 @@ func Test_ConsumesBalanceChangeEvent(t *testing.T) {
 
 	// then
 	assert.Eventually(t, func() bool {
-		return keeper.GetState().Identities[0].Balance.Cmp(big.NewInt(999)) == 0
+		return keeper.GetState().Identities[0].Balance == "999"
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
@@ -467,7 +467,7 @@ func Test_ConsumesEarningsChangeEvent(t *testing.T) {
 	keeper := NewKeeper(deps, time.Millisecond)
 	err := keeper.Subscribe(eventBus)
 	assert.NoError(t, err)
-	assert.Zero(t, keeper.GetState().Identities[0].Balance.Uint64())
+	assert.Equal(t, "0", keeper.GetState().Identities[0].Balance)
 	assert.Len(t, keeper.GetState().ProviderChannels, 1)
 	assert.Equal(t, channelsProvider.Channels, keeper.GetState().ProviderChannels)
 

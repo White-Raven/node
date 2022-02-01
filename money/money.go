@@ -30,6 +30,15 @@ type Money struct {
 	Currency Currency `json:"currency,omitempty"`
 }
 
+// NewString convenience wrapper for New.
+func NewString(amount string, currency ...Currency) Money {
+	b, ok := big.NewInt(0).SetString(amount, 10)
+	if !ok {
+		return New(big.NewInt(0))
+	}
+	return New(b)
+}
+
 // New returns a new instance of Money.
 // Expected `amount` value for 1 myst is equal to 1_000_000_000_000_000_000.
 // It also allows for an optional currency value to be passed,

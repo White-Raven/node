@@ -49,7 +49,7 @@ type IdentityDTO struct {
 	Address            string   `json:"id"`
 	RegistrationStatus string   `json:"registration_status"`
 	ChannelAddress     string   `json:"channel_address"`
-	Balance            *big.Int `json:"balance"`
+	Balance            string   `json:"balance"`
 	Earnings           *big.Int `json:"earnings"`
 	EarningsTotal      *big.Int `json:"earnings_total"`
 	Stake              *big.Int `json:"stake"`

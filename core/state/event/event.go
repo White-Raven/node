@@ -51,7 +51,7 @@ type Identity struct {
 	Address            string
 	RegistrationStatus registry.RegistrationStatus
 	ChannelAddress     common.Address
-	Balance            *big.Int
+	Balance            string
 	Earnings           *big.Int
 	EarningsTotal      *big.Int
 	HermesID           common.Address

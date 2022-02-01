@@ -192,7 +192,7 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
 			Address:            "0xd535eba31e9bd2d7a4e34852e6292b359e5c77f7",
 			RegistrationStatus: registry.Registered,
 			ChannelAddress:     common.HexToAddress("0x000000000000000000000000000000000000000a"),
-			Balance:            big.NewInt(50),
+			Balance:            big.NewInt(50).String(),
 			Earnings:           big.NewInt(1),
 			EarningsTotal:      big.NewInt(100),
 		},
@@ -226,7 +226,7 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
         "registration_status": "Registered",
         "channel_address": "0x000000000000000000000000000000000000000A",
         "hermes_id": "0x0000000000000000000000000000000000000000",
-        "balance": 50,
+        "balance": "50",
         "earnings": 1,
 		"earnings_total": 100,
 		"stake": 0

@@ -603,12 +603,15 @@ func consumerConnectFlow(t *testing.T, tequilapi *tequilapi_client.Client, consu
 		consumerStatus = cs
 		return true
 	}, time.Second*20, time.Millisecond*150)
-	assert.True(t, consumerStatus.Balance.Cmp(big.NewInt(0)) == 1, "consumer balance should not be empty")
-	assert.True(t, consumerStatus.Balance.Cmp(balanceAfterRegistration) == -1, "balance should decrease but is %s", consumerStatus.Balance)
+
+	consumberBalance, ok := big.NewInt(0).SetString(consumerStatus.Balance, 10)
+	assert.True(t, ok)
+	assert.True(t, consumberBalance.Cmp(big.NewInt(0)) == 1, "consumer balance should not be empty")
+	assert.True(t, consumberBalance.Cmp(balanceAfterRegistration) == -1, "balance should decrease but is %s", consumerStatus.Balance)
 	assert.Zero(t, consumerStatus.Earnings.Uint64())
 	assert.Zero(t, consumerStatus.EarningsTotal.Uint64())
 
-	return new(big.Int).Sub(balanceAfterRegistration, consumerStatus.Balance)
+	return new(big.Int).Sub(balanceAfterRegistration, consumberBalance)
 }
 
 func consumerRejectWhitelistedFlow(t *testing.T, tequilapi *tequilapi_client.Client, consumerID, accountantID, serviceType string, proposal contract.ProposalDTO) {
