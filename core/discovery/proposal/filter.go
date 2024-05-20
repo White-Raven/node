@@ -36,6 +36,7 @@ type Filter struct {
 	IPType                             string
 	AccessPolicy, AccessPolicySource   string
 	CompatibilityMin, CompatibilityMax int
+	BandwidthMin                       float64
 	QualityMin                         float32
 	ExcludeUnsupported                 bool
 	IncludeMonitoringFailed            bool
@@ -89,6 +90,7 @@ func (filter *Filter) Matches(proposal market.ServiceProposal) bool {
 // ToAPIQuery serialises filter to query of Mysterium API
 func (filter *Filter) ToAPIQuery() mysterium.ProposalsQuery {
 	query := mysterium.ProposalsQuery{
+		PresetID:                filter.PresetID,
 		ProviderID:              filter.ProviderID,
 		ProviderIDs:             filter.ProviderIDs,
 		ServiceType:             filter.ServiceType,
@@ -99,6 +101,7 @@ func (filter *Filter) ToAPIQuery() mysterium.ProposalsQuery {
 		AccessPolicy:            filter.AccessPolicy,
 		AccessPolicySource:      filter.AccessPolicySource,
 		QualityMin:              filter.QualityMin,
+		BandwidthMin:            filter.BandwidthMin,
 		IncludeMonitoringFailed: filter.IncludeMonitoringFailed,
 		NATCompatibility:        filter.NATCompatibility,
 	}

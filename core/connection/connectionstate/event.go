@@ -40,6 +40,7 @@ const (
 
 // AppEventConnectionState is the struct we'll emit on a AppEventConnectionState topic event
 type AppEventConnectionState struct {
+	UUID        string
 	State       State
 	SessionInfo Status
 }
@@ -87,7 +88,7 @@ func (s *Status) Duration() time.Duration {
 		return time.Duration(0)
 	}
 
-	return time.Now().Sub(s.StartedAt)
+	return time.Since(s.StartedAt)
 }
 
 const (
@@ -105,6 +106,7 @@ type AppEventConnectionSession struct {
 
 // AppEventConnectionStatistics represents a session statistics event
 type AppEventConnectionStatistics struct {
+	UUID        string
 	Stats       Statistics
 	SessionInfo Status
 }

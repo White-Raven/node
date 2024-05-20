@@ -25,17 +25,18 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/datasize"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/market"
 	"github.com/mysteriumnetwork/node/session/pingpong/event"
-
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/mysteriumnetwork/payments/crypto"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
 )
 
 // ErrWrongProvider represents an issue where the wrong provider is supplied.
@@ -59,6 +60,7 @@ type PeerExchangeMessageSender interface {
 type consumerTotalsStorage interface {
 	Store(chainID int64, id identity.Identity, hermesID common.Address, amount *big.Int) error
 	Get(chainID int64, id identity.Identity, hermesID common.Address) (*big.Int, error)
+	Add(chainID int64, id identity.Identity, hermesID common.Address, amount *big.Int) error
 }
 
 type timeTracker interface {
@@ -98,6 +100,7 @@ type InvoicePayerDeps struct {
 	Ks                        hashSigner
 	Identity, Peer            identity.Identity
 	AgreedPrice               market.Price
+	SenderUUID                string
 	SessionID                 string
 	AddressProvider           addressProvider
 	EventBus                  eventbus.EventBus
@@ -125,7 +128,7 @@ var ErrInvoiceMissmatch = errors.New("invoice mismatch")
 // Start starts the message exchange tracker. Blocks.
 func (ip *InvoicePayer) Start() error {
 	log.Debug().Msg("Starting...")
-	addr, err := ip.deps.AddressProvider.GetChannelAddress(ip.deps.ChainID, ip.deps.Identity)
+	addr, err := ip.deps.AddressProvider.GetActiveChannelAddress(ip.deps.ChainID, ip.deps.Identity.ToCommonAddress())
 	if err != nil {
 		return errors.Wrap(err, "could not generate channel address")
 	}
@@ -133,7 +136,12 @@ func (ip *InvoicePayer) Start() error {
 
 	ip.deps.TimeTracker.StartTracking()
 
-	err = ip.deps.EventBus.Subscribe(connectionstate.AppTopicConnectionStatistics, ip.consumeDataTransferredEvent)
+	uid, err := uuid.NewV4()
+	if err != nil {
+		return err
+	}
+
+	err = ip.deps.EventBus.SubscribeWithUID(connectionstate.AppTopicConnectionStatistics, uid.String(), ip.consumeDataTransferredEvent)
 	if err != nil {
 		return errors.Wrap(err, "could not subscribe to data transfer events")
 	}
@@ -141,6 +149,8 @@ func (ip *InvoicePayer) Start() error {
 	for {
 		select {
 		case <-ip.stop:
+			_ = ip.deps.EventBus.UnsubscribeWithUID(connectionstate.AppTopicConnectionStatistics, uid.String(), ip.consumeDataTransferredEvent)
+
 			return nil
 		case invoice := <-ip.deps.InvoiceChan:
 			log.Debug().Msgf("Invoice received: %v", invoice)
@@ -160,19 +170,7 @@ func (ip *InvoicePayer) Start() error {
 }
 
 func (ip *InvoicePayer) incrementGrandTotalPromised(amount big.Int) error {
-	res, err := ip.deps.ConsumerTotalsStorage.Get(ip.chainID(), ip.deps.Identity, ip.deps.HermesAddress)
-	if err != nil {
-		if err == ErrNotFound {
-			log.Debug().Msg("No previous invoice grand total, assuming zero")
-			res = big.NewInt(0)
-		} else {
-			return errors.Wrap(err, "could not get previous grand total")
-		}
-	}
-	if res == nil {
-		res = big.NewInt(0)
-	}
-	return ip.deps.ConsumerTotalsStorage.Store(ip.chainID(), ip.deps.Identity, ip.deps.HermesAddress, new(big.Int).Add(res, &amount))
+	return ip.deps.ConsumerTotalsStorage.Add(ip.chainID(), ip.deps.Identity, ip.deps.HermesAddress, &amount)
 }
 
 func (ip *InvoicePayer) isInvoiceOK(invoice crypto.Invoice) error {
@@ -284,6 +282,7 @@ func (ip *InvoicePayer) publishInvoicePayedEvent(invoice crypto.Invoice) {
 	}
 
 	ip.deps.EventBus.Publish(event.AppTopicInvoicePaid, event.AppEventInvoicePaid{
+		UUID:       ip.deps.SenderUUID,
 		ConsumerID: ip.deps.Identity,
 		SessionID:  ip.deps.SessionID,
 		Invoice:    invoice,
@@ -294,7 +293,6 @@ func (ip *InvoicePayer) publishInvoicePayedEvent(invoice crypto.Invoice) {
 func (ip *InvoicePayer) Stop() {
 	ip.once.Do(func() {
 		log.Debug().Msg("Stopping...")
-		_ = ip.deps.EventBus.Unsubscribe(connectionstate.AppTopicConnectionStatistics, ip.consumeDataTransferredEvent)
 		close(ip.stop)
 	})
 }

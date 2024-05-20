@@ -21,23 +21,25 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"text/template"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/go-ci/env"
 	"github.com/mysteriumnetwork/go-ci/job"
 	"github.com/mysteriumnetwork/go-ci/shell"
-	"github.com/mysteriumnetwork/go-ci/util"
+	"github.com/mysteriumnetwork/node/ci/deb"
 	"github.com/mysteriumnetwork/node/ci/storage"
 	"github.com/mysteriumnetwork/node/logconfig"
-	"github.com/rs/zerolog/log"
 )
 
 // PackageLinuxAmd64 builds and stores linux amd64 package
 func PackageLinuxAmd64() error {
 	logconfig.Bootstrap()
-	if err := packageStandalone("build/myst/myst_linux_amd64", "linux", "amd64"); err != nil {
+	if err := packageStandalone("build/myst/myst_linux_amd64", "linux", "amd64", nil); err != nil {
 		return err
 	}
 	return env.IfRelease(storage.UploadArtifacts)
@@ -46,7 +48,19 @@ func PackageLinuxAmd64() error {
 // PackageLinuxArm builds and stores linux arm package
 func PackageLinuxArm() error {
 	logconfig.Bootstrap()
-	if err := packageStandalone("build/myst/myst_linux_arm", "linux", "arm"); err != nil {
+	if err := packageStandalone("build/myst/myst_linux_arm", "linux", "arm", nil); err != nil {
+		return err
+	}
+	return env.IfRelease(storage.UploadArtifacts)
+}
+
+// PackageLinuxArmv6l builds and stores linux armv6 package
+func PackageLinuxArmv6l() error {
+	logconfig.Bootstrap()
+	extraEnv := map[string]string{
+		"GOARM": "6",
+	}
+	if err := packageStandalone("build/myst/myst_linux_armv6l", "linux", "arm", extraEnv); err != nil {
 		return err
 	}
 	return env.IfRelease(storage.UploadArtifacts)
@@ -71,7 +85,7 @@ func PackageLinuxDebianAmd64() error {
 	return env.IfRelease(storage.UploadArtifacts)
 }
 
-// PackageLinuxDebianArm builds and stores debian arm package
+// PackageLinuxDebianArm builds and stores debian armv7l+ package
 func PackageLinuxDebianArm() error {
 	logconfig.Bootstrap()
 	if err := goGet("github.com/debber/debber-v0.3/cmd/debber"); err != nil {
@@ -85,6 +99,26 @@ func PackageLinuxDebianArm() error {
 		return err
 	}
 	if err := packageDebian("build/myst/myst", "armhf"); err != nil {
+		return err
+	}
+	return env.IfRelease(storage.UploadArtifacts)
+}
+
+// PackageLinuxDebianArmv6l builds and stores debian armv6l package
+func PackageLinuxDebianArmv6l() error {
+	logconfig.Bootstrap()
+	if err := goGet("github.com/debber/debber-v0.3/cmd/debber"); err != nil {
+		return err
+	}
+	envi := map[string]string{
+		"GOOS":   "linux",
+		"GOARCH": "arm",
+		"GOARM":  "6",
+	}
+	if err := sh.RunWith(envi, "bin/build"); err != nil {
+		return err
+	}
+	if err := packageDebian("build/myst/myst", "armv6l"); err != nil {
 		return err
 	}
 	return env.IfRelease(storage.UploadArtifacts)
@@ -112,7 +146,7 @@ func PackageLinuxDebianArm64() error {
 // PackageMacOSAmd64 builds and stores macOS amd64 package
 func PackageMacOSAmd64() error {
 	logconfig.Bootstrap()
-	if err := packageStandalone("build/myst/myst_darwin_amd64", "darwin", "amd64"); err != nil {
+	if err := packageStandalone("build/myst/myst_darwin_amd64", "darwin", "amd64", nil); err != nil {
 		return err
 	}
 	return env.IfRelease(storage.UploadArtifacts)
@@ -121,7 +155,7 @@ func PackageMacOSAmd64() error {
 // PackageMacOSArm64 builds and stores macOS arm64 package
 func PackageMacOSArm64() error {
 	logconfig.Bootstrap()
-	if err := packageStandalone("build/myst/myst_darwin_arm64", "darwin", "arm64"); err != nil {
+	if err := packageStandalone("build/myst/myst_darwin_arm64", "darwin", "arm64", nil); err != nil {
 		return err
 	}
 	return env.IfRelease(storage.UploadArtifacts)
@@ -130,23 +164,7 @@ func PackageMacOSArm64() error {
 // PackageWindowsAmd64 builds and stores Windows amd64 package
 func PackageWindowsAmd64() error {
 	logconfig.Bootstrap()
-	if err := packageStandalone("build/myst/myst_windows_amd64.exe", "windows", "amd64"); err != nil {
-		return err
-	}
-	return env.IfRelease(storage.UploadArtifacts)
-}
-
-// PackageIOS builds and stores iOS package
-func PackageIOS() error {
-	job.Precondition(func() bool {
-		pr, _ := env.IsPR()
-		fullBuild, _ := env.IsFullBuild()
-		return !pr || fullBuild
-	})
-	logconfig.Bootstrap()
-	mg.Deps(vendordModules)
-
-	if err := sh.RunV("bin/package_ios", "amd64"); err != nil {
+	if err := packageStandalone("build/myst/myst_windows_amd64.exe", "windows", "amd64", nil); err != nil {
 		return err
 	}
 	return env.IfRelease(storage.UploadArtifacts)
@@ -186,7 +204,59 @@ func PackageAndroid() error {
 	buildVersion := env.Str(env.BuildVersion)
 	log.Info().Msgf("Package Android SDK version: %s", buildVersion)
 
-	pomFileOut, err := os.Create("build/package/mvn.pom")
+	pomFileOut, err := os.Create(fmt.Sprintf("build/package/mobile-node-%s.pom", buildVersion))
+	if err != nil {
+		return err
+	}
+	defer pomFileOut.Close()
+
+	err = pomTemplate.Execute(pomFileOut, struct {
+		BuildVersion string
+	}{
+		BuildVersion: buildVersion,
+	})
+	if err != nil {
+		return err
+	}
+
+	return env.IfRelease(storage.UploadArtifacts)
+}
+
+// PackageAndroidProvider builds and stores Android Provider package
+func PackageAndroidProvider() error {
+	job.Precondition(func() bool {
+		pr, _ := env.IsPR()
+		fullBuild, _ := env.IsFullBuild()
+		return !pr || fullBuild
+	})
+	logconfig.Bootstrap()
+
+	if err := sh.RunV("bin/package_android_provider", "amd64"); err != nil {
+		return err
+	}
+
+	// Artifacts created by xgo (docker) on CI environment are owned by root.
+	// Chown package folder so we can create a POM (see below) in it.
+	if _, isCI := os.LookupEnv("CI"); isCI {
+		err := shell.NewCmd("sudo chown -R gitlab-runner:gitlab-runner build/package").Run()
+		if err != nil {
+			return err
+		}
+	}
+
+	err := env.EnsureEnvVars(env.BuildVersion)
+	if err != nil {
+		return err
+	}
+	pomTemplate, err := template.ParseFiles("bin/package/android_provider/mvn.pom")
+	if err != nil {
+		return err
+	}
+
+	buildVersion := env.Str(env.BuildVersion)
+	log.Info().Msgf("Package Android Provider SDK version: %s", buildVersion)
+
+	pomFileOut, err := os.Create(fmt.Sprintf("build/package/provider-mobile-node-%s.pom", buildVersion))
 	if err != nil {
 		return err
 	}
@@ -212,12 +282,21 @@ func makeCacheRef(cacheRepo string) string {
 	return cacheRepo + ":build-cache"
 }
 
-func buildDockerImage(dockerfile string, buildArgs map[string]string, cacheRepo string, tags []string, push bool) error {
+func buildDockerImage(dockerfile string, buildArgs map[string]string, cacheRepo string, tags []string, push bool, platforms []string) error {
 	mg.Deps(binFmtSupport)
 
-	args := []string{"docker", "buildx", "build",
+	if platforms == nil {
+		platforms = []string{
+			"linux/amd64",
+			"linux/arm64",
+			"linux/arm",
+		}
+	}
+
+	args := []string{
+		"docker", "buildx", "build",
 		"--file", dockerfile,
-		"--platform", "linux/amd64,linux/arm64,linux/arm",
+		"--platform", strings.Join(platforms, ","),
 		"--output", fmt.Sprintf("type=image,push=%v", push),
 	}
 	for buildArgKey, buildArgValue := range buildArgs {
@@ -251,6 +330,7 @@ func BuildMystAlpineImage(tags []string, push bool) error {
 		"mysteriumnetwork/myst",
 		tags,
 		push,
+		nil,
 	)
 }
 
@@ -263,6 +343,9 @@ func BuildMystDocumentationImage(tags []string, push bool) error {
 		"mysteriumnetwork/documentation",
 		tags,
 		push,
+		[]string{
+			"linux/amd64",
+		},
 	)
 }
 
@@ -286,39 +369,17 @@ func PackageDockerSwaggerRedoc() error {
 	})
 }
 
-// vendordModules uses vend tool to create vendor directory from installed go modules.
-// This is a temporary solution needed for ios and android builds since gomobile
-// does not support go modules yet and go mod vendor does not include c dependencies.
-func vendordModules() error {
-	mg.Deps(checkVend)
-	return sh.RunV("vend")
-}
-
-func checkVend() error {
-	path, _ := util.GetGoBinaryPath("vend")
-	if path != "" {
-		fmt.Println("Tool 'vend' already installed")
-		return nil
-	}
-	err := goGet("github.com/mysteriumnetwork/vend")
-	if err != nil {
-		fmt.Println("could not go get vend")
-		return err
-	}
-	return nil
-}
-
 func goGet(pkg string) error {
 	return sh.RunWith(map[string]string{"GO111MODULE": "off"}, "go", "get", "-u", pkg)
 }
 
-func packageStandalone(binaryPath, os, arch string) error {
+func packageStandalone(binaryPath, os, arch string, extraEnvs map[string]string) error {
 	log.Info().Msgf("Packaging %s %s %s", binaryPath, os, arch)
 	var err error
 	if os == "linux" {
 		filename := path.Base(binaryPath)
 		binaryPath = path.Join("build", filename, filename)
-		err = buildBinaryFor(path.Join("cmd", "mysterium_node", "mysterium_node.go"), filename, os, arch, true)
+		err = buildBinaryFor(path.Join("cmd", "mysterium_node", "mysterium_node.go"), filename, os, arch, extraEnvs, true)
 	} else {
 		err = buildCrossBinary(os, arch)
 	}
@@ -326,7 +387,7 @@ func packageStandalone(binaryPath, os, arch string) error {
 		return err
 	}
 
-	err = buildBinaryFor(path.Join("cmd", "supervisor", "supervisor.go"), "myst_supervisor", os, arch, true)
+	err = buildBinaryFor(path.Join("cmd", "supervisor", "supervisor.go"), "myst_supervisor", os, arch, extraEnvs, true)
 	if err != nil {
 		return err
 	}
@@ -337,15 +398,6 @@ func packageStandalone(binaryPath, os, arch string) error {
 	return sh.RunWith(envs, "bin/package_standalone", os)
 }
 
-func packageSupervisor(os, arch string) error {
-	log.Info().Msgf("Packaging supervisor %s %s", os, arch)
-	envs := map[string]string{
-		"GOOS":   os,
-		"GOARCH": arch,
-	}
-	return sh.RunWith(envs, "bin/package_supervisor", os, arch)
-}
-
 func packageDebian(binaryPath, arch string) error {
 	if err := env.EnsureEnvVars(env.BuildVersion); err != nil {
 		return err
@@ -353,5 +405,10 @@ func packageDebian(binaryPath, arch string) error {
 	envs := map[string]string{
 		"BINARY": binaryPath,
 	}
+
+	if err := deb.TermsTemplateFile("bin/package/installation/templates"); err != nil {
+		return err
+	}
+
 	return sh.RunWith(envs, "bin/package_debian", env.Str(env.BuildVersion), arch)
 }

@@ -30,6 +30,9 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
@@ -38,8 +41,6 @@ import (
 	sessionEvent "github.com/mysteriumnetwork/node/session/event"
 	"github.com/mysteriumnetwork/node/session/pingpong/event"
 	"github.com/mysteriumnetwork/payments/crypto"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
 )
 
 // ErrConsumerPromiseValidationFailed represents an error where consumer tries to cheat us with incorrect promises.
@@ -143,7 +144,6 @@ type InvoiceTrackerDeps struct {
 	InvoiceStorage             providerInvoiceStorage
 	TimeTracker                timeTracker
 	ChargePeriodLeeway         time.Duration
-	ChargePeriod               time.Duration
 	ExchangeMessageChan        chan crypto.ExchangeMessage
 	ExchangeMessageWaitTimeout time.Duration
 	ProviderID                 identity.Identity
@@ -155,13 +155,18 @@ type InvoiceTrackerDeps struct {
 	EventBus                   eventbus.EventBus
 	SessionID                  string
 	PromiseHandler             promiseHandler
-	MaxNotPaidInvoice          *big.Int
 	ChainID                    int64
+	ChargePeriod               time.Duration
+	LimitChargePeriod          time.Duration
+	LimitNotPaidInvoice        *big.Int
+	MaxNotPaidInvoice          *big.Int
+	Observer                   observerApi
 }
 
 // NewInvoiceTracker creates a new instance of invoice tracker.
 func NewInvoiceTracker(
-	itd InvoiceTrackerDeps) *InvoiceTracker {
+	itd InvoiceTrackerDeps,
+) *InvoiceTracker {
 	return &InvoiceTracker{
 		lastExchangeMessage: crypto.ExchangeMessage{
 			Promise: crypto.Promise{
@@ -272,10 +277,10 @@ func (it *InvoiceTracker) handleExchangeMessage(em crypto.ExchangeMessage) error
 
 // Start stars the invoice tracker
 func (it *InvoiceTracker) Start() error {
-	log.Debug().Msg("Starting...")
+	log.Debug().Msgf("Starting invoice tracker for session %s", it.deps.SessionID)
 	it.deps.TimeTracker.StartTracking()
 
-	if err := it.deps.EventBus.SubscribeAsync(sessionEvent.AppTopicDataTransferred, it.consumeDataTransferredEvent); err != nil {
+	if err := it.deps.EventBus.SubscribeWithUID(sessionEvent.AppTopicDataTransferred, it.deps.SessionID, it.consumeDataTransferredEvent); err != nil {
 		return err
 	}
 
@@ -311,7 +316,7 @@ func (it *InvoiceTracker) Start() error {
 		return fmt.Errorf("could not send first invoice: %w", err)
 	}
 
-	go it.sendInvoicesWhenNeeded(time.Second * 2)
+	go it.sendInvoicesWhenNeeded(time.Second)
 	for {
 		select {
 		case <-it.stop:
@@ -335,7 +340,7 @@ func (it *InvoiceTracker) Start() error {
 		case pErr := <-it.promiseErrors:
 			err := it.handleHermesError(pErr)
 			if err != nil {
-				return fmt.Errorf("could not request promise %w", err)
+				return fmt.Errorf("could not request promise: %w", err)
 			}
 		}
 	}
@@ -355,12 +360,48 @@ func (it *InvoiceTracker) sendInvoicesWhenNeeded(interval time.Duration) {
 			if diff.Cmp(it.deps.MaxNotPaidInvoice) >= 0 && currentlyElapsed-it.lastInvoiceSent > it.invoiceDebounceRate {
 				it.lastInvoiceSent = it.deps.TimeTracker.Elapsed()
 				it.invoiceChannel <- true
+
+				it.updateMaxUnpaid()
 			} else if currentlyElapsed-it.lastInvoiceSent > it.deps.ChargePeriod {
 				it.lastInvoiceSent = it.deps.TimeTracker.Elapsed()
 				it.invoiceChannel <- false
+
+				it.updateTimer()
 			}
 		}
 	}
+}
+
+const sessionInvoiceIncreaseSlope = 3
+
+func (it *InvoiceTracker) updateMaxUnpaid() {
+	limit := it.deps.LimitNotPaidInvoice
+	if limit == nil || it.deps.MaxNotPaidInvoice.Cmp(limit) >= 0 {
+		return
+	}
+
+	add := new(big.Int).Div(it.deps.MaxNotPaidInvoice, new(big.Int).SetInt64(sessionInvoiceIncreaseSlope))
+	bigger := new(big.Int).Add(it.deps.MaxNotPaidInvoice, add)
+	if bigger.Cmp(limit) > 0 {
+		bigger = limit
+	}
+
+	it.deps.MaxNotPaidInvoice = bigger
+	log.Debug().Str("invoice_amount", it.deps.MaxNotPaidInvoice.String()).Msg("Max invoice amount increased")
+}
+
+func (it *InvoiceTracker) updateTimer() {
+	maxTime := it.deps.LimitChargePeriod
+	if it.deps.ChargePeriod >= maxTime {
+		return
+	}
+
+	newMaxTime := it.deps.ChargePeriod/sessionInvoiceIncreaseSlope + it.deps.ChargePeriod
+	if newMaxTime > maxTime {
+		newMaxTime = maxTime
+	}
+	it.deps.ChargePeriod = newMaxTime
+	log.Debug().Int64("change_period (ms)", it.deps.ChargePeriod.Milliseconds()).Msg("Max charge period increased")
 }
 
 // WaitFirstInvoice waits for a first invoice to be paid.
@@ -426,12 +467,6 @@ func (it *InvoiceTracker) getNotSentExchangeMessageCount() uint64 {
 	return it.notSentExchangeMessageCount
 }
 
-func (it *InvoiceTracker) generateR() []byte {
-	r := make([]byte, 32)
-	crand.Read(r)
-	return r
-}
-
 func (it *InvoiceTracker) saveLastExchangeMessage(em crypto.ExchangeMessage) {
 	it.lastExchangeMessageLock.Lock()
 	defer it.lastExchangeMessageLock.Unlock()
@@ -466,10 +501,17 @@ func (it *InvoiceTracker) sendInvoice(isCritical bool) error {
 		log.Debug().Msgf("Being lenient for the first payment, asking for %v", shouldBe)
 	}
 
-	r := it.generateR()
-	invoice := crypto.CreateInvoice(it.agreementID, shouldBe, new(big.Int), r, it.chainID())
+	r, err := crypto.GenerateR()
+	if err != nil {
+		return fmt.Errorf("failed to generate R: %w", err)
+	}
+	invoice, err := crypto.CreateInvoice(it.agreementID, shouldBe, new(big.Int), r, it.chainID())
+	if err != nil {
+		return fmt.Errorf("failed to create invoice: %w", err)
+	}
+
 	invoice.Provider = it.deps.ProviderID.Address
-	err := it.deps.PeerInvoiceSender.Send(invoice)
+	err = it.deps.PeerInvoiceSender.Send(invoice)
 	if err != nil {
 		return err
 	}
@@ -586,7 +628,7 @@ func (it *InvoiceTracker) validateExchangeMessage(em crypto.ExchangeMessage) err
 	}
 
 	if em.ChainID != it.chainID() {
-		return fmt.Errorf("Invalid chain id in exchange message: expected %v, got %v", it.chainID(), em.ChainID)
+		return fmt.Errorf("invalid chain id in exchange message: expected %v, got %v", it.chainID(), em.ChainID)
 	}
 
 	signer, err := em.Promise.RecoverSigner()
@@ -609,12 +651,18 @@ func (it *InvoiceTracker) validateExchangeMessage(em crypto.ExchangeMessage) err
 		return errors.Wrap(err, "could not get registry address")
 	}
 
-	chimp, err := it.deps.AddressProvider.GetChannelImplementation(em.ChainID)
+	hermesId := common.HexToAddress(em.HermesID)
+	chimp, err := it.deps.AddressProvider.GetChannelImplementationForHermes(em.ChainID, hermesId)
 	if err != nil {
-		return errors.Wrap(err, "could not get channel implementation")
+		log.Err(err).Msgf("Failed to get channel implementation for hermes %s, using fallback", em.HermesID)
+		hermesData, err := it.deps.Observer.GetHermesData(em.ChainID, hermesId)
+		if err != nil {
+			return errors.Wrap(err, "could not get channel implementation")
+		}
+		chimp = hermesData.ChannelImpl
 	}
 
-	addr, err := it.deps.AddressProvider.GetArbitraryChannelAddress(common.HexToAddress(em.HermesID), registry, chimp, it.deps.Peer)
+	addr, err := it.deps.AddressProvider.GetArbitraryChannelAddress(common.HexToAddress(em.HermesID), registry, chimp, it.deps.Peer.ToCommonAddress())
 	if err != nil {
 		return errors.Wrap(err, "could not generate channel address")
 	}
@@ -634,8 +682,8 @@ func (it *InvoiceTracker) validateExchangeMessage(em crypto.ExchangeMessage) err
 // Stop stops the invoice tracker.
 func (it *InvoiceTracker) Stop() {
 	it.once.Do(func() {
-		log.Debug().Msg("Stopping...")
-		_ = it.deps.EventBus.Unsubscribe(sessionEvent.AppTopicDataTransferred, it.consumeDataTransferredEvent)
+		log.Debug().Msgf("Stopping invoice tracker for session %s", it.deps.SessionID)
+		_ = it.deps.EventBus.UnsubscribeWithUID(sessionEvent.AppTopicDataTransferred, it.deps.SessionID, it.consumeDataTransferredEvent)
 		close(it.stop)
 	})
 }

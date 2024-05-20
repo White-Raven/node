@@ -31,6 +31,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/mysteriumnetwork/node/core/discovery/proposal"
+	"github.com/mysteriumnetwork/node/core/location/locationstate"
 	"github.com/mysteriumnetwork/node/market"
 	"github.com/mysteriumnetwork/node/mocks"
 	"github.com/mysteriumnetwork/node/nat"
@@ -51,8 +52,8 @@ var serviceProposals = []proposal.PricedServiceProposal{
 			Quality:  &mockQuality,
 		}),
 		Price: market.Price{
-			PricePerHour: big.NewInt(1),
-			PricePerGiB:  big.NewInt(2),
+			PricePerHour: big.NewInt(500_000_000_000_000_000),
+			PricePerGiB:  big.NewInt(1_000_000_000_000_000_000),
 		},
 	},
 	{
@@ -61,8 +62,8 @@ var serviceProposals = []proposal.PricedServiceProposal{
 			Quality:  &mockQuality,
 		}),
 		Price: market.Price{
-			PricePerHour: big.NewInt(1),
-			PricePerGiB:  big.NewInt(2),
+			PricePerHour: big.NewInt(500_000_000_000_000_000),
+			PricePerGiB:  big.NewInt(1_000_000_000_000_000_000),
 		},
 	},
 }
@@ -77,6 +78,24 @@ func (m *mockNATProber) Probe(_ context.Context) (nat.NATType, error) {
 }
 
 var mockedNATProber = &mockNATProber{"none", nil}
+
+type mockResolver struct{}
+
+func (r *mockResolver) DetectLocation() (locationstate.Location, error) {
+	return locationstate.Location{}, nil
+}
+
+func (r *mockResolver) DetectProxyLocation(_ int) (locationstate.Location, error) {
+	return r.DetectLocation()
+}
+
+type mockPricer struct {
+	priceToReturn market.Price
+}
+
+func (mpip *mockPricer) GetCurrentPrice(nodeType string, country string, serviceType string) (market.Price, error) {
+	return mpip.priceToReturn, nil
+}
 
 func TestProposalsEndpointListByNodeId(t *testing.T) {
 	repository := &mockProposalRepository{
@@ -108,7 +127,7 @@ func TestProposalsEndpointListByNodeId(t *testing.T) {
             "proposals": [
                 {
                     "format": "service-proposal/v3",
-                    "compatibility": 1,
+                    "compatibility": 2,
                     "provider_id": "0xProviderId",
                     "service_type": "testprotocol",
                     "location": {
@@ -119,12 +138,23 @@ func TestProposalsEndpointListByNodeId(t *testing.T) {
                     "quality": {
                       "quality": 2.0,
                       "latency": 50,
-                      "bandwidth": 10
+                      "bandwidth": 10,
+                      "uptime": 20
                     },
 					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
+					  "currency": "MYST",
+					  "per_gib": 1000000000000000000,
+					  "per_gib_tokens": {
+						"ether": "1",
+						"human": "1",
+						"wei": "1000000000000000000"
+					  },
+					  "per_hour": 500000000000000000,
+					  "per_hour_tokens": {
+						"ether": "0.5",
+						"human": "0.5",
+						"wei": "500000000000000000"
+					  }
 					}
                 }
             ]
@@ -135,6 +165,7 @@ func TestProposalsEndpointListByNodeId(t *testing.T) {
 	assert.EqualValues(t, &proposal.Filter{
 		ProviderID:         "0xProviderId",
 		ExcludeUnsupported: true,
+		CompatibilityMin:   2,
 	}, repository.recordedFilter)
 }
 
@@ -168,7 +199,7 @@ func TestProposalsEndpointAcceptsAccessPolicyParams(t *testing.T) {
             "proposals": [
                 {
                     "format": "service-proposal/v3",
-                    "compatibility": 1,
+                    "compatibility": 2,
                     "provider_id": "0xProviderId",
                     "service_type": "testprotocol",
                     "location": {
@@ -179,12 +210,23 @@ func TestProposalsEndpointAcceptsAccessPolicyParams(t *testing.T) {
                     "quality": {
                       "quality": 2.0,
                       "latency": 50,
-                      "bandwidth": 10
+                      "bandwidth": 10,
+                      "uptime": 20
                     },
 					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
+					  "currency": "MYST",
+					  "per_gib": 1000000000000000000,
+					  "per_gib_tokens": {
+						"ether": "1",
+						"human": "1",
+						"wei": "1000000000000000000"
+					  },
+					  "per_hour": 500000000000000000,
+					  "per_hour_tokens": {
+						"ether": "0.5",
+						"human": "0.5",
+						"wei": "500000000000000000"
+					  }
 					}
                 }
             ]
@@ -196,8 +238,66 @@ func TestProposalsEndpointAcceptsAccessPolicyParams(t *testing.T) {
 			AccessPolicy:       "accessPolicy",
 			AccessPolicySource: "accessPolicySource",
 			ExcludeUnsupported: true,
+			CompatibilityMin:   2,
 		},
 		repository.recordedFilter,
+	)
+}
+
+func TestCurrentPrices(t *testing.T) {
+	// given
+	repository := &mockProposalRepository{
+		proposals: serviceProposals,
+	}
+	presetRepository := &mockFilterPresetRepository{
+		presets: proposal.FilterPresets{Entries: []proposal.FilterPreset{
+			{
+				ID:     0,
+				Name:   "",
+				IPType: "",
+			},
+		}},
+	}
+	endpoint := NewProposalsEndpoint(repository, &mockPricer{
+		priceToReturn: market.Price{
+			PricePerHour: big.NewInt(123_000_000_000_000_000),
+			PricePerGiB:  big.NewInt(456_000_000_000_000_000),
+		},
+	}, &mockResolver{}, presetRepository, mockedNATProber)
+
+	path := "/prices/current"
+	req, err := http.NewRequest(
+		http.MethodGet,
+		path,
+		nil,
+	)
+	assert.Nil(t, err)
+
+	g := gin.Default()
+	g.GET(path, endpoint.CurrentPrice)
+	resp := httptest.NewRecorder()
+	g.ServeHTTP(resp, req)
+
+	assert.JSONEq(
+		t,
+		`
+				{
+				  "service_type": "wireguard",
+				  "price_per_hour": 123000000000000000,
+				  "price_per_hour_tokens": {
+					"wei": "123000000000000000",
+					"ether": "0.123",
+					"human": "0.123"
+				  },
+				  "price_per_gib": 456000000000000000,
+				  "price_per_gib_tokens": {
+					"wei": "456000000000000000",
+					"ether": "0.456",
+					"human": "0.456"
+				  }
+				}
+				`,
+		resp.Body.String(),
 	)
 }
 
@@ -235,7 +335,7 @@ func TestProposalsEndpointFilterByPresetID(t *testing.T) {
             "proposals": [
                 {
                     "format": "service-proposal/v3",
-                    "compatibility": 1,
+                    "compatibility": 2,
                     "provider_id": "0xProviderId",
                     "service_type": "testprotocol",
                     "location": {
@@ -246,17 +346,28 @@ func TestProposalsEndpointFilterByPresetID(t *testing.T) {
                     "quality": {
                       "quality": 2.0,
                       "latency": 50,
-                      "bandwidth": 10
+                      "bandwidth": 10,
+                      "uptime": 20
                     },
 					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
+					  "currency": "MYST",
+					  "per_gib": 1000000000000000000,
+					  "per_gib_tokens": {
+						"ether": "1",
+						"human": "1",
+						"wei": "1000000000000000000"
+					  },
+					  "per_hour": 500000000000000000,
+					  "per_hour_tokens": {
+						"ether": "0.5",
+						"human": "0.5",
+						"wei": "500000000000000000"
+					  }
 					}
                 },
                 {
                     "format": "service-proposal/v3",
-                    "compatibility": 1,
+                    "compatibility": 2,
                     "provider_id": "other_provider",
                     "service_type": "testprotocol",
                     "location": {
@@ -267,12 +378,23 @@ func TestProposalsEndpointFilterByPresetID(t *testing.T) {
                     "quality": {
                       "quality": 2.0,
                       "latency": 50,
-                      "bandwidth": 10
+                      "bandwidth": 10,
+                      "uptime": 20
                     },
 					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
+					  "currency": "MYST",
+					  "per_gib": 1000000000000000000,
+					  "per_gib_tokens": {
+						"ether": "1",
+						"human": "1",
+						"wei": "1000000000000000000"
+					  },
+					  "per_hour": 500000000000000000,
+					  "per_hour_tokens": {
+						"ether": "0.5",
+						"human": "0.5",
+						"wei": "500000000000000000"
+					  }
 					}
                 }
             ]

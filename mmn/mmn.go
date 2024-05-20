@@ -19,11 +19,17 @@ package mmn
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/mysteriumnetwork/node/tequilapi/pkce"
+
+	"github.com/mysteriumnetwork/node/tequilapi/sso"
 
 	"github.com/rs/zerolog/log"
 
@@ -42,12 +48,16 @@ type MMN struct {
 	ipResolver ip.Resolver
 
 	lastIP       string
-	lastIdentity string
+	lastIdentity identity.Identity
+
+	mystnodesURL   string
+	claimPath      string
+	onboardingPath string
 }
 
 // NewMMN creates new instance of MMN
 func NewMMN(resolver ip.Resolver, client *client) *MMN {
-	return &MMN{client: client, ipResolver: resolver}
+	return &MMN{client: client, ipResolver: resolver, mystnodesURL: config.GetString(config.FlagMMNAddress), claimPath: "/node-claim", onboardingPath: "/clickboarding"}
 }
 
 // Subscribe subscribes to node events and reports them to MMN
@@ -75,7 +85,7 @@ func (m *MMN) handleNodeStart(e nodevent.Payload) {
 }
 
 func (m *MMN) handleIdentityUnlock(ev identity.AppEventIdentityUnlock) {
-	m.lastIdentity = ev.ID.Address
+	m.lastIdentity = ev.ID
 }
 
 // handleServiceStart does auto-register to MMN, but only for providers.
@@ -91,26 +101,70 @@ func (m *MMN) handleServiceStart(e servicestate.AppEventServiceStatus) {
 		return
 	}
 
-	if err := m.register(); err != nil {
+	if err := m.ClaimNode(); err != nil {
 		log.Error().Msgf("Failed to register identity to MMN: %v", err)
 	}
 }
 
-func (m *MMN) register() error {
-	return m.client.RegisterNode(&NodeInformationDto{
+func (m *MMN) claimRequestNoRedirect() NodeClaimRequest {
+	return m.claimRequest(nil)
+}
+
+func (m *MMN) claimRequest(redirectURL *url.URL) NodeClaimRequest {
+	rru := ""
+	if redirectURL != nil {
+		rru = fmt.Sprint(redirectURL)
+	}
+	return NodeClaimRequest{
 		LocalIP:     m.lastIP,
-		Identity:    m.lastIdentity,
+		Identity:    m.lastIdentity.Address,
 		APIKey:      config.GetString(config.FlagMMNAPIKey),
 		VendorID:    config.GetString(config.FlagVendorID),
 		Arch:        runtime.GOOS + docker() + "/" + runtime.GOARCH,
 		OS:          getOS(),
 		NodeVersion: metadata.VersionAsString(),
-	})
+		RedirectURL: rru,
+	}
 }
 
-// Register registers node to MMN
-func (m *MMN) Register() error {
-	return m.register()
+func (m *MMN) onboardingRequest(info pkce.Info, redirectURL *url.URL) sso.MystnodesMessage {
+	return sso.MystnodesMessage{
+		CodeChallenge: info.CodeChallenge,
+		Identity:      m.lastIdentity.Address,
+		RedirectURL:   fmt.Sprint(redirectURL),
+	}
+}
+
+// ClaimNode registers node to MMN
+func (m *MMN) ClaimNode() error {
+	return m.client.ClaimNode(m.claimRequestNoRedirect())
+}
+
+// ClaimLink generate claim link
+func (m *MMN) ClaimLink(redirectURL *url.URL) (*url.URL, error) {
+	claimRequestJson, err := m.claimRequest(redirectURL).json()
+	if err != nil {
+		return nil, err
+	}
+
+	signature, err := m.client.signer(m.lastIdentity).Sign(claimRequestJson)
+	if err != nil {
+		return nil, err
+	}
+
+	link, err := url.Parse(m.mystnodesURL)
+	if err != nil {
+		return nil, err
+	}
+
+	link = link.JoinPath(m.claimPath)
+
+	q := link.Query()
+	q.Set("message", base64.RawURLEncoding.EncodeToString(claimRequestJson))
+	q.Set("signature", base64.RawURLEncoding.EncodeToString(signature.Bytes()))
+	link.RawQuery = q.Encode()
+
+	return link, nil
 }
 
 func getOS() string {
@@ -135,7 +189,7 @@ func getOS() string {
 			log.Error().Err(err).Msg("Failed to get OS information")
 			return "windows (unknown)"
 		}
-		return strings.TrimSpace(strings.TrimPrefix(string(output), "Caption="))
+		return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(output)), "Caption="))
 	}
 	return runtime.GOOS
 }

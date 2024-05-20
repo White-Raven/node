@@ -19,15 +19,17 @@ package service
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/mysteriumnetwork/node/core/ip"
-	"github.com/mysteriumnetwork/node/core/policy"
+	"github.com/mysteriumnetwork/node/core/policy/localcopy"
 	"github.com/mysteriumnetwork/node/core/service"
 	"github.com/mysteriumnetwork/node/core/service/servicestate"
+	"github.com/mysteriumnetwork/node/dns"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/market"
 	"github.com/mysteriumnetwork/node/nat"
@@ -45,6 +47,7 @@ var connectionEndpointStub = &mockConnectionEndpoint{}
 
 func Test_Manager_Stop(t *testing.T) {
 	manager := newManagerStub(pubIP, outIP, country)
+
 	service := service.NewInstance(
 		identity.FromAddress("0x1"),
 		"",
@@ -52,7 +55,7 @@ func Test_Manager_Stop(t *testing.T) {
 		market.ServiceProposal{},
 		servicestate.Running,
 		nil,
-		policy.NewRepository(),
+		localcopy.NewRepository(),
 		nil,
 	)
 
@@ -64,6 +67,57 @@ func Test_Manager_Stop(t *testing.T) {
 	waitABit()
 	err := manager.Stop()
 	assert.NoError(t, err)
+}
+
+func Test_Manager_Stop_Datarace(t *testing.T) {
+	manager := newManagerStub(pubIP, outIP, country)
+
+	service := service.NewInstance(
+		identity.FromAddress("0x1"),
+		"",
+		nil,
+		market.ServiceProposal{},
+		servicestate.Running,
+		nil,
+		localcopy.NewRepository(),
+		nil,
+	)
+	manager.sessionCleanup = make(map[string]func())
+
+	destroyClosure := func(sessionID string) func() {
+		return func() {
+			manager.sessionCleanupMu.Lock()
+			defer manager.sessionCleanupMu.Unlock()
+
+			_, ok := manager.sessionCleanup[sessionID]
+			if !ok {
+				return
+			}
+			delete(manager.sessionCleanup, sessionID)
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		err := manager.Serve(service)
+		assert.NoError(t, err)
+	}()
+
+	// normally the ProvideConfig() sets a callback, but in unit test we have to do it ourselves
+	manager.sessionCleanupMu.Lock()
+	manager.sessionCleanup["1"] = destroyClosure("1")
+	manager.sessionCleanupMu.Unlock()
+
+	waitABit()
+	go func() {
+		defer wg.Done()
+		err := manager.Stop()
+		assert.NoError(t, err)
+	}()
+	wg.Wait()
 }
 
 func Test_Manager_ProviderConfig_FailsWhenSessionConfigIsInvalid(t *testing.T) {
@@ -96,11 +150,13 @@ func (mce *mockConnectionEndpoint) Config() (wg.ServiceConfig, error)    { retur
 func (mce *mockConnectionEndpoint) AddPeer(_ string, _ wgcfg.Peer) error { return nil }
 func (mce *mockConnectionEndpoint) RemovePeer(_ string) error            { return nil }
 func (mce *mockConnectionEndpoint) ConfigureRoutes(_ net.IP) error       { return nil }
-func (mce *mockConnectionEndpoint) PeerStats() (*wgcfg.Stats, error) {
-	return &wgcfg.Stats{LastHandshake: time.Now()}, nil
+func (mce *mockConnectionEndpoint) PeerStats() (wgcfg.Stats, error) {
+	return wgcfg.Stats{LastHandshake: time.Now()}, nil
 }
 
 func newManagerStub(pub, out, country string) *Manager {
+	dnsHandler, _ := dns.ResolveViaSystem()
+
 	return &Manager{
 		done:       make(chan struct{}),
 		ipResolver: ip.NewResolverMock("1.2.3.4"),
@@ -108,6 +164,7 @@ func newManagerStub(pub, out, country string) *Manager {
 		connEndpointFactory: func() (wg.ConnectionEndpoint, error) {
 			return connectionEndpointStub, nil
 		},
+		dnsProxy: dns.NewProxy("", 0, dnsHandler),
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/gofrs/uuid"
 	"github.com/rs/zerolog/log"
 
 	"github.com/mysteriumnetwork/node/config"
@@ -127,7 +128,7 @@ type validator interface {
 type TimeGetter func() time.Time
 
 // PaymentEngineFactory creates a new payment issuer from the given params
-type PaymentEngineFactory func(channel p2p.Channel, consumer, provider identity.Identity, hermes common.Address, proposal proposal.PricedServiceProposal, price market.Price) (PaymentIssuer, error)
+type PaymentEngineFactory func(senderUUID string, channel p2p.Channel, consumer, provider identity.Identity, hermes common.Address, proposal proposal.PricedServiceProposal, price market.Price) (PaymentIssuer, error)
 
 // ProposalLookup returns a service proposal based on predefined conditions.
 type ProposalLookup func() (proposal *proposal.PricedServiceProposal, err error)
@@ -166,6 +167,9 @@ type connectionManager struct {
 	connectOptions ConnectOptions
 
 	activeConnection Connection
+	statsTracker     statsTracker
+
+	uuid string
 }
 
 // NewManager creates connection manager with given dependencies
@@ -181,7 +185,12 @@ func NewManager(
 	p2pDialer p2p.Dialer,
 	preReconnect, postReconnect func(),
 ) *connectionManager {
-	return &connectionManager{
+	uuid, err := uuid.NewV4()
+	if err != nil {
+		panic(err) // This should never happen.
+	}
+
+	m := &connectionManager{
 		newConnection:        connectionCreator,
 		status:               connectionstate.Status{State: connectionstate.NotConnected},
 		eventBus:             eventBus,
@@ -197,7 +206,12 @@ func NewManager(
 		timeGetter:           time.Now,
 		preReconnect:         preReconnect,
 		postReconnect:        postReconnect,
+		uuid:                 uuid.String(),
 	}
+
+	m.eventBus.SubscribeAsync(connectionstate.AppTopicConnectionState, m.reconnectOnHold)
+
+	return m
 }
 
 func (m *connectionManager) chainID() int64 {
@@ -278,19 +292,17 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 		return m.handleStartError(sessionID, err)
 	}
 
-	statsPublisher := newStatsPublisher(m.eventBus, m.statsReportInterval)
-	go statsPublisher.start(m, m.activeConnection)
+	m.statsTracker = newStatsTracker(m.eventBus, m.statsReportInterval)
+	go m.statsTracker.start(m, m.activeConnection)
 	m.addCleanup(func() error {
 		log.Trace().Msg("Cleaning: stopping statistics publisher")
 		defer log.Trace().Msg("Cleaning: stopping statistics publisher DONE")
-		statsPublisher.stop()
+		m.statsTracker.stop()
 		return nil
 	})
 
 	go m.consumeConnectionStates(m.activeConnection.State())
 	go m.checkSessionIP(m.channel, m.connectOptions.ConsumerID, m.connectOptions.SessionID, originalPublicIP)
-
-	m.eventBus.SubscribeAsync(connectionstate.AppTopicConnectionState, m.reconnectOnHold)
 
 	return nil
 }
@@ -344,7 +356,6 @@ func (m *connectionManager) priceFromProposal(proposal proposal.PricedServicePro
 	}
 
 	return p
-
 }
 
 func (m *connectionManager) initSession(tracer *trace.Tracer, prc market.Price) (sessionID session.ID, err error) {
@@ -398,6 +409,10 @@ func (m *connectionManager) handleStartError(sessionID session.ID, err error) er
 }
 
 func (m *connectionManager) clearIPCache() {
+	if config.GetBool(config.FlagProxyMode) || config.GetBool(config.FlagDVPNMode) {
+		return
+	}
+
 	if cr, ok := m.ipResolver.(*ip.CachedResolver); ok {
 		cr.ClearCache()
 	}
@@ -405,6 +420,10 @@ func (m *connectionManager) clearIPCache() {
 
 // checkSessionIP checks if IP has changed after connection was established.
 func (m *connectionManager) checkSessionIP(channel p2p.Channel, consumerID identity.Identity, sessionID session.ID, originalPublicIP string) {
+	if config.GetBool(config.FlagProxyMode) || config.GetBool(config.FlagDVPNMode) {
+		return
+	}
+
 	for i := 1; i <= m.config.IPCheck.MaxAttempts; i++ {
 		// Skip check if not connected. This may happen when context was canceled via Disconnect.
 		if m.Status().State != connectionstate.Connected {
@@ -465,7 +484,7 @@ func (m *connectionManager) getPublicIP() string {
 }
 
 func (m *connectionManager) paymentLoop(opts ConnectOptions, price market.Price) (PaymentIssuer, error) {
-	payments, err := m.paymentEngineFactory(m.channel, opts.ConsumerID, identity.FromAddress(opts.Proposal.ProviderID), opts.HermesID, opts.Proposal, price)
+	payments, err := m.paymentEngineFactory(m.uuid, m.channel, opts.ConsumerID, identity.FromAddress(opts.Proposal.ProviderID), opts.HermesID, opts.Proposal, price)
 	if err != nil {
 		return nil, err
 	}
@@ -605,7 +624,6 @@ func (m *connectionManager) createP2PSession(c Connection, opts ConnectOptions, 
 	if err != nil {
 		return nil, fmt.Errorf("could not unmarshal session reply to proto: %w", err)
 	}
-	log.Info().Msgf("Provider's session config: %s", string(sessionResponse.Config))
 
 	channel := m.channel
 	m.acknowledge = func() {
@@ -645,17 +663,26 @@ func (m *connectionManager) createP2PSession(c Connection, opts ConnectOptions, 
 }
 
 func (m *connectionManager) publishSessionCreate(sessionID session.ID) {
+	sessionInfo := m.Status()
+	// avoid printing IP address in logs
+	sessionInfo.ConsumerLocation.IP = ""
+
 	m.eventBus.Publish(connectionstate.AppTopicConnectionSession, connectionstate.AppEventConnectionSession{
 		Status:      connectionstate.SessionCreatedStatus,
-		SessionInfo: m.Status(),
+		SessionInfo: sessionInfo,
 	})
 
 	m.addCleanup(func() error {
 		log.Trace().Msg("Cleaning: publishing session ended status")
 		defer log.Trace().Msg("Cleaning: publishing session ended status DONE")
+
+		sessionInfo := m.Status()
+		// avoid printing IP address in logs
+		sessionInfo.ConsumerLocation.IP = ""
+
 		m.eventBus.Publish(connectionstate.AppTopicConnectionSession, connectionstate.AppEventConnectionSession{
 			Status:      connectionstate.SessionEndedStatus,
-			SessionInfo: m.Status(),
+			SessionInfo: sessionInfo,
 		})
 		return nil
 	})
@@ -691,6 +718,17 @@ func (m *connectionManager) Status() connectionstate.Status {
 	defer m.statusLock.RUnlock()
 
 	return m.status
+}
+
+func (m *connectionManager) UUID() string {
+	m.statusLock.RLock()
+	defer m.statusLock.RUnlock()
+
+	return m.uuid
+}
+
+func (m *connectionManager) Stats() connectionstate.Statistics {
+	return m.statsTracker.stats()
 }
 
 func (m *connectionManager) setStatus(delta func(status *connectionstate.Status)) {
@@ -893,9 +931,14 @@ func (m *connectionManager) reconnectOnHold(state connectionstate.AppEventConnec
 }
 
 func (m *connectionManager) publishStateEvent(state connectionstate.State) {
+	sessionInfo := m.Status()
+	// avoid printing IP address in logs
+	sessionInfo.ConsumerLocation.IP = ""
+
 	m.eventBus.Publish(connectionstate.AppTopicConnectionState, connectionstate.AppEventConnectionState{
+		UUID:        m.uuid,
 		State:       state,
-		SessionInfo: m.Status(),
+		SessionInfo: sessionInfo,
 	})
 }
 
@@ -954,7 +997,7 @@ func (m *connectionManager) sendKeepAlivePing(ctx context.Context, channel p2p.C
 
 	m.eventBus.Publish(quality.AppTopicConsumerPingP2P, quality.PingEvent{
 		SessionID: string(sessionID),
-		Duration:  time.Now().Sub(start),
+		Duration:  time.Since(start),
 	})
 
 	return nil

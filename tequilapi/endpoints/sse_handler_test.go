@@ -28,14 +28,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
-
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/gin-gonic/gin"
+	"github.com/mysteriumnetwork/node/identity"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	nodeEvent "github.com/mysteriumnetwork/node/core/node/event"
 	stateEvent "github.com/mysteriumnetwork/node/core/state/event"
 	"github.com/mysteriumnetwork/node/identity/registry"
-	"github.com/stretchr/testify/assert"
+	"github.com/mysteriumnetwork/node/session/pingpong/event"
 )
 
 type mockStateProvider struct {
@@ -44,6 +46,10 @@ type mockStateProvider struct {
 
 func (msp *mockStateProvider) GetState() stateEvent.State {
 	return msp.stateToReturn
+}
+
+func (msp *mockStateProvider) GetConnection(id string) stateEvent.Connection {
+	return msp.stateToReturn.Connections["1"]
 }
 
 func TestHandler_Stops(t *testing.T) {
@@ -84,7 +90,7 @@ func TestHandler_ConsumeNodeEvent_Starts(t *testing.T) {
 }
 
 func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
-	msp := &mockStateProvider{}
+	msp := &mockStateProvider{stateToReturn: stateEvent.State{Connections: make(map[string]stateEvent.Connection)}}
 	h := NewSSEHandler(msp)
 	go h.serve()
 	defer h.stop()
@@ -144,7 +150,7 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
 	},
     "consumer": {
       "connection": {
-        "status": ""
+        "status": "NotConnected"
       }
     },
     "identities": [],
@@ -175,7 +181,7 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
 	},
     "consumer": {
       "connection": {
-        "status": ""
+        "status": "NotConnected"
       }
     },
     "identities": [],
@@ -185,8 +191,11 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
 }`
 	assert.JSONEq(t, expectJSON, msgJSON)
 
+	msp.stateToReturn.Connections["1"] = stateEvent.Connection{
+		Session:    connectionstate.Status{State: connectionstate.Connecting, SessionID: "1", ConsumerID: identity.Identity{Address: "0x123"}},
+		Statistics: connectionstate.Statistics{BytesSent: 1, BytesReceived: 2},
+	}
 	changedState = msp.GetState()
-	changedState.Connection.Session.State = connectionstate.Connecting
 	changedState.Identities = []stateEvent.Identity{
 		{
 			Address:            "0xd535eba31e9bd2d7a4e34852e6292b359e5c77f7",
@@ -195,6 +204,12 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
 			Balance:            big.NewInt(50),
 			Earnings:           big.NewInt(1),
 			EarningsTotal:      big.NewInt(100),
+			EarningsPerHermes: map[common.Address]event.Earnings{
+				common.HexToAddress("0x200000000000000000000000000000000000000a"): {
+					LifetimeBalance:  big.NewInt(100),
+					UnsettledBalance: big.NewInt(50),
+				},
+			},
 		},
 	}
 	h.ConsumeStateEvent(changedState)
@@ -204,42 +219,68 @@ func TestHandler_SendsInitialAndFollowingStates(t *testing.T) {
 	msgJSON = strings.TrimPrefix(msg, "data: ")
 	expectJSON = `
 {
-  "payload": {
-    "service_info": null,
-    "sessions": [],
-    "sessions_stats": {
-      "count": 0,
-      "count_consumers": 0,
-      "sum_bytes_received": 0,
-      "sum_bytes_sent": 0,
-      "sum_duration": 0,
-      "sum_tokens": 0
-	},
-    "consumer": {
-      "connection": {
-        "status": "Connecting"
-      }
-    },
-    "identities": [
-      {
-        "id": "0xd535eba31e9bd2d7a4e34852e6292b359e5c77f7",
-        "registration_status": "Registered",
-        "channel_address": "0x000000000000000000000000000000000000000A",
-        "hermes_id": "0x0000000000000000000000000000000000000000",
-        "balance": 50,
-		"balance_tokens": {
-			"wei": "50",
-			"ether": "0.00000000000000005",
-			"human": "0"
+	"payload": {
+		"service_info": null,
+		"sessions": [],
+		"sessions_stats": {
+			"count": 0,
+			"count_consumers": 0,
+			"sum_bytes_received": 0,
+			"sum_bytes_sent": 0,
+			"sum_duration": 0,
+			"sum_tokens": 0
 		},
-        "earnings": 1,
-		"earnings_total": 100,
-		"stake": 0
-      }
-    ],
-    "channels": []
-  },
-  "type": "state-change"
+		"consumer": {
+			"connection": {
+				"consumer_id":"0x123",
+				"session_id": "1",
+				"status": "Connecting"
+			}
+		},
+		"identities": [
+			{
+				"id": "0xd535eba31e9bd2d7a4e34852e6292b359e5c77f7",
+				"registration_status": "Registered",
+				"channel_address": "0x000000000000000000000000000000000000000A",
+				"balance": 50,
+				"earnings": 1,
+				"earnings_total": 100,
+				"balance_tokens": {
+					"wei": "50",
+					"ether": "0.00000000000000005",
+					"human": "0"
+				},
+				"earnings_tokens": {
+					"wei": "1",
+					"ether": "0.000000000000000001",
+					"human": "0"
+				},
+				"earnings_total_tokens": {
+					"wei": "100",
+					"ether": "0.0000000000000001",
+					"human": "0"
+				},
+				"stake": 0,
+				"hermes_id": "0x0000000000000000000000000000000000000000",
+				"earnings_per_hermes": {
+					"0x200000000000000000000000000000000000000A": {
+						"earnings": {
+							"wei": "50",
+							"ether": "0.00000000000000005",
+							"human": "0"
+						},
+						"earnings_total": {
+							"wei": "100",
+							"ether": "0.0000000000000001",
+							"human": "0"
+						}
+					}
+				}
+			}
+		],
+		"channels": []
+	},
+	"type": "state-change"
 }`
 	assert.JSONEq(t, expectJSON, msgJSON)
 

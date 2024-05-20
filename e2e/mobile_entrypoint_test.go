@@ -19,32 +19,37 @@ package e2e
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/mobile/mysterium"
 	"github.com/mysteriumnetwork/payments/crypto"
 )
 
 func TestMobileNodeConsumer(t *testing.T) {
-	dir, err := ioutil.TempDir("", "mobileEntryPoint")
+	dir, err := os.MkdirTemp("", "mobileEntryPoint")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
+	err = os.Mkdir(filepath.Join(dir, ".mysterium"), 0777)
+	require.NoError(t, err)
+
 	options := &mysterium.MobileNodeOptions{
-		Mainnet:                        true,
-		MysteriumAPIAddress:            "http://discovery:8080/api/v3",
+		Network:                        string(config.Mainnet),
+		DiscoveryAddress:               "http://discovery:8080/api/v4",
 		BrokerAddresses:                []string{"broker"},
 		EtherClientRPCL1:               []string{"http://ganache:8545"},
 		EtherClientRPCL2:               []string{"ws://ganache2:8545"},
 		FeedbackURL:                    "TODO",
-		QualityOracleURL:               "http://morqa:8085/api/v2",
+		QualityOracleURL:               "http://morqa:8085/api/v3",
 		IPDetectorURL:                  "http://ipify:3000/?format=json",
 		LocationDetectorURL:            "https://location.mysterium.network/api/v1/location",
 		TransactorEndpointAddress:      "http://transactor:8888/api/v1",
@@ -52,10 +57,10 @@ func TestMobileNodeConsumer(t *testing.T) {
 		ActiveChainID:                  80001,
 		Chain1ID:                       5,
 		Chain2ID:                       80001,
-		MystSCAddress:                  "0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665",
-		RegistrySCAddress:              "0x241F6e1d0bB17f45767DC60A6Bd3D21Cdb543a0c",
-		HermesSCAddress:                "0x676b9a084aC11CEeF680AF6FFbE99b24106F47e7",
-		ChannelImplementationSCAddress: "0xAA9C4E723609Cb913430143fbc86D3CBe7ADCa21",
+		MystSCAddress:                  "0xaa9c4e723609cb913430143fbc86d3cbe7adca21",
+		RegistrySCAddress:              "0x427c2bad22335710aec5e477f3e3adcd313a9bcb",
+		HermesSCAddress:                "0xd68defb97d0765741f8ecf179df2f9564e1466a3",
+		ChannelImplementationSCAddress: "0x599d43715df3070f83355d9d90ae62c159e62a75",
 	}
 
 	node, err := mysterium.NewNode(dir, options)
@@ -63,10 +68,17 @@ func TestMobileNodeConsumer(t *testing.T) {
 	require.NotNil(t, node)
 
 	t.Run("Test status", func(t *testing.T) {
-		status := node.GetStatus()
+		resp, err := node.GetStatus()
+		require.NoError(t, err)
+
+		var status mysterium.GetStatusResponse
+		err = json.Unmarshal(resp, &status)
+
+		require.NoError(t, err)
+
 		require.Equal(t, "NotConnected", status.State)
-		require.Equal(t, "", status.ProviderID)
-		require.Equal(t, "", status.ServiceType)
+		require.Equal(t, "", status.Proposal.ProviderID)
+		require.Equal(t, "", status.Proposal.ServiceType)
 	})
 
 	t.Run("Test identity registration", func(t *testing.T) {
@@ -94,9 +106,11 @@ func TestMobileNodeConsumer(t *testing.T) {
 		identity, err := node.GetIdentity(&mysterium.GetIdentityRequest{})
 		require.NoError(t, err)
 
-		balance, err := node.GetBalance(&mysterium.GetBalanceRequest{IdentityAddress: identity.IdentityAddress})
-		require.NoError(t, err)
-		require.Equal(t, crypto.BigMystToFloat(balanceAfterRegistration), balance.Balance)
+		assert.Eventually(t, func() bool {
+			balance, err := node.GetBalance(&mysterium.GetBalanceRequest{IdentityAddress: identity.IdentityAddress})
+			require.NoError(t, err)
+			return crypto.BigMystToFloat(balanceAfterRegistration) == balance.Balance
+		}, time.Second*5, 100*time.Millisecond)
 	})
 
 	t.Run("Test identity export", func(t *testing.T) {

@@ -19,10 +19,11 @@ package endpoints
 
 import (
 	"encoding/json"
-	"net/http"
 	"reflect"
 
 	"github.com/gin-gonic/gin"
+	"github.com/mysteriumnetwork/go-rest/apierror"
+	"github.com/mysteriumnetwork/node/tequilapi/contract"
 
 	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/tequilapi/utils"
@@ -54,92 +55,106 @@ func newConfigAPI(config configProvider) *configAPI {
 
 // GetConfig returns current configuration
 // swagger:operation GET /config Configuration getConfig
-// ---
-// summary: Returns current configuration values
-// description: Returns default configuration
-// responses:
-//   200:
-//     description: Currently active configuration
-//     schema:
-//       "$ref": "#/definitions/configPayload"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Returns current configuration values
+//	description: Returns default configuration
+//	responses:
+//	  200:
+//	    description: Currently active configuration
+//	    schema:
+//	      "$ref": "#/definitions/configPayload"
 func (api *configAPI) GetConfig(c *gin.Context) {
-	writer := c.Writer
 	res := configPayload{Data: api.config.GetConfig()}
-	utils.WriteAsJSON(res, writer)
+	utils.WriteAsJSON(res, c.Writer)
 }
 
 // GetDefaultConfig returns default configuration
 // swagger:operation GET /config/default Configuration getDefaultConfig
-// ---
-// summary: Returns default configuration
-// description: Returns default configuration
-// responses:
-//   200:
-//     description: Default configuration values
-//     schema:
-//       "$ref": "#/definitions/configPayload"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Returns default configuration
+//	description: Returns default configuration
+//	responses:
+//	  200:
+//	    description: Default configuration values
+//	    schema:
+//	      "$ref": "#/definitions/configPayload"
 func (api *configAPI) GetDefaultConfig(c *gin.Context) {
-	writer := c.Writer
 	res := configPayload{Data: api.config.GetDefaultConfig()}
-	utils.WriteAsJSON(res, writer)
+	utils.WriteAsJSON(res, c.Writer)
+}
+
+// GetUiFeatures returns config.ui.features value
+// swagger:operation GET /config/ui/features
+//
+//	---
+//	summary: Returns returns config.ui.features value
+//	description: Returns returns config.ui.features value
+//	responses:
+//	  200:
+//	    description: Default configuration values
+//	    schema:
+//	      type: string
+func (api *configAPI) GetUiFeatures(c *gin.Context) {
+	res := ""
+	cfg := api.config.GetConfig()
+	ui, ok := cfg["ui"].((map[string]interface{}))
+	if ok {
+		res_, ok := ui["features"]
+		if ok {
+			res = res_.(string)
+		}
+	}
+	c.Writer.Write([]byte(res))
 }
 
 // GetUserConfig returns current user configuration
 // swagger:operation GET /config/user Configuration getUserConfig
-// ---
-// summary: Returns current user configuration
-// description: Returns current user configuration
-// responses:
-//   200:
-//     description: User set configuration values
-//     schema:
-//       "$ref": "#/definitions/configPayload"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Returns current user configuration
+//	description: Returns current user configuration
+//	responses:
+//	  200:
+//	    description: User set configuration values
+//	    schema:
+//	      "$ref": "#/definitions/configPayload"
 func (api *configAPI) GetUserConfig(c *gin.Context) {
-	writer := c.Writer
 	res := configPayload{Data: api.config.GetUserConfig()}
-	utils.WriteAsJSON(res, writer)
+	utils.WriteAsJSON(res, c.Writer)
 }
 
 // SetUserConfig sets and returns current configuration
 // swagger:operation POST /config/user Configuration serUserConfig
-// ---
-// summary: Sets and returns user configuration
-// description: For keys present in the payload, it will set or remove the user config values (if the key is null). Changes are persisted to the config file.
-// parameters:
-//   - in: body
-//     name: body
-//     description: configuration keys/values
-//     schema:
-//       $ref: "#/definitions/configPayload"
-// responses:
-//   200:
-//     description: User configuration
-//     schema:
-//       "$ref": "#/definitions/configPayload"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Sets and returns user configuration
+//	description: For keys present in the payload, it will set or remove the user config values (if the key is null). Changes are persisted to the config file.
+//	parameters:
+//	  - in: body
+//	    name: body
+//	    description: configuration keys/values
+//	    schema:
+//	      $ref: "#/definitions/configPayload"
+//	responses:
+//	  200:
+//	    description: User configuration
+//	    schema:
+//	      "$ref": "#/definitions/configPayload"
+//	  400:
+//	    description: Failed to parse or request validation failed
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (api *configAPI) SetUserConfig(c *gin.Context) {
-	httpReq := c.Request
-	writer := c.Writer
-
 	var req configPayload
-	err := json.NewDecoder(httpReq.Body).Decode(&req)
+	err := json.NewDecoder(c.Request.Body).Decode(&req)
 	if err != nil {
-		utils.SendError(writer, err, http.StatusBadRequest)
+		c.Error(apierror.ParseFailed())
 		return
 	}
 	for k, v := range req.Data {
@@ -153,7 +168,7 @@ func (api *configAPI) SetUserConfig(c *gin.Context) {
 	}
 	err = api.config.SaveUserConfig()
 	if err != nil {
-		utils.SendError(writer, err, http.StatusInternalServerError)
+		c.Error(apierror.Internal("Failed to save config", contract.ErrCodeConfigSave))
 		return
 	}
 	api.GetUserConfig(c)
@@ -181,6 +196,7 @@ func AddRoutesForConfig(
 		g.GET("/default", api.GetDefaultConfig)
 		g.GET("/user", api.GetUserConfig)
 		g.POST("/user", api.SetUserConfig)
+		g.GET("/ui/features", api.GetUiFeatures)
 	}
 	return nil
 }

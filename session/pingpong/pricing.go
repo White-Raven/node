@@ -18,6 +18,7 @@
 package pingpong
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -53,13 +54,41 @@ func NewPricer(discoAPI discoAPI) *Pricer {
 			PerCountry: make(map[string]*market.PriceHistory),
 			Defaults: &market.PriceHistory{
 				Current: &market.PriceByType{
-					Residential: &market.Price{
-						PricePerHour: defaultPrice.PricePerHour,
-						PricePerGiB:  defaultPrice.PricePerGiB,
+					Residential: &market.PriceByServiceType{
+						Wireguard: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
+						Scraping: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
+						DataTransfer: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
+						DVPN: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
 					},
-					Other: &market.Price{
-						PricePerHour: defaultPrice.PricePerHour,
-						PricePerGiB:  defaultPrice.PricePerGiB,
+					Other: &market.PriceByServiceType{
+						Wireguard: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
+						Scraping: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
+						DataTransfer: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
+						DVPN: &market.Price{
+							PricePerHour: defaultPrice.PricePerHour,
+							PricePerGiB:  defaultPrice.PricePerGiB,
+						},
 					},
 				},
 			},
@@ -70,10 +99,14 @@ func NewPricer(discoAPI discoAPI) *Pricer {
 }
 
 // GetCurrentPrice gets the current price from cache if possible, fetches it otherwise.
-func (p *Pricer) GetCurrentPrice(nodeType string, country string) (market.Price, error) {
+func (p *Pricer) GetCurrentPrice(nodeType string, country string, serviceType string) (market.Price, error) {
 	pricing := p.getPricing()
 
-	return *p.getCurrentByType(pricing, nodeType, country), nil
+	price := p.getCurrentByType(pricing, nodeType, country, serviceType)
+	if price == nil {
+		return market.Price{}, errors.New("no data available")
+	}
+	return *price, nil
 }
 
 func (p *Pricer) getPriceForCountry(pricing market.LatestPrices, country string) *market.PriceHistory {
@@ -84,38 +117,51 @@ func (p *Pricer) getPriceForCountry(pricing market.LatestPrices, country string)
 	return pricing.Defaults
 }
 
-func (p *Pricer) getCurrentByType(pricing market.LatestPrices, nodeType string, country string) *market.Price {
+func (p *Pricer) getCurrentByType(pricing market.LatestPrices, nodeType string, country string, serviceType string) *market.Price {
 	base := p.getPriceForCountry(pricing, country)
 	switch strings.ToLower(nodeType) {
-	case "residential":
-		return base.Current.Residential
+	case "residential", "cellular":
+		return p.getCurrentByServiceType(base.Current.Residential, serviceType)
 	default:
-		return base.Current.Other
+		return p.getCurrentByServiceType(base.Current.Other, serviceType)
 	}
 }
 
-func (p *Pricer) getPreviousByType(pricing market.LatestPrices, nodeType string, country string) *market.Price {
+func (p *Pricer) getCurrentByServiceType(pricingByServiceType *market.PriceByServiceType, serviceType string) *market.Price {
+	switch strings.ToLower(serviceType) {
+	case "wireguard":
+		return pricingByServiceType.Wireguard
+	case "scraping":
+		return pricingByServiceType.Scraping
+	case "dvpn":
+		return pricingByServiceType.DVPN
+	default:
+		return pricingByServiceType.DataTransfer
+	}
+}
+
+func (p *Pricer) getPreviousByType(pricing market.LatestPrices, nodeType string, country string, serviceType string) *market.Price {
 	base := p.getPriceForCountry(pricing, country)
 	switch strings.ToLower(nodeType) {
-	case "residential":
-		return base.Previous.Residential
+	case "residential", "cellular":
+		return p.getCurrentByServiceType(base.Previous.Residential, serviceType)
 	default:
-		return base.Previous.Other
+		return p.getCurrentByServiceType(base.Previous.Other, serviceType)
 	}
 }
 
 // IsPriceValid checks if the given price is valid or not.
-func (p *Pricer) IsPriceValid(in market.Price, nodeType string, country string) bool {
+func (p *Pricer) IsPriceValid(in market.Price, nodeType string, country string, serviceType string) bool {
 	if config.GetBool(config.FlagPaymentsDuringSessionDebug) {
 		log.Info().Msg("Payments debug bas been enabled, will agree with any price given")
 		return true
 	}
 
 	pricing := p.getPricing()
-	if p.pricesEqual(p.getCurrentByType(pricing, nodeType, country), in) {
+	if p.pricesEqual(p.getCurrentByType(pricing, nodeType, country, serviceType), in) {
 		return true
 	}
-	if p.pricesEqual(p.getPreviousByType(pricing, nodeType, country), in) {
+	if p.pricesEqual(p.getPreviousByType(pricing, nodeType, country, serviceType), in) {
 		return true
 	}
 

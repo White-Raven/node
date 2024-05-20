@@ -18,8 +18,6 @@
 package endpoints
 
 import (
-	"net/http"
-
 	"github.com/gin-gonic/gin"
 
 	"github.com/mysteriumnetwork/node/requests"
@@ -57,34 +55,37 @@ func NewAccessPoliciesEndpoint(httpClient *requests.HTTPClient, accessPolicyEndp
 }
 
 // swagger:operation GET /access-policies AccessPolicies
-// ---
-// summary: Returns access policies
-// description: Returns list of access policies
-// responses:
-//   200:
-//     description: List of access policies
-//     schema:
-//       "$ref": "#/definitions/AccessPolicies"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Returns access policies
+//	description: Returns list of access policies
+//	responses:
+//	  200:
+//	    description: List of access policies
+//	    schema:
+//	      "$ref": "#/definitions/AccessPolicies"
+//	  400:
+//	    description: Failed to parse or request validation failed
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (ape *accessPoliciesEndpoint) List(c *gin.Context) {
-	resp := c.Writer
-
 	req, err := requests.NewGetRequest(ape.accessPolicyEndpointURL, "", nil)
 	if err != nil {
-		utils.SendError(resp, err, http.StatusInternalServerError)
+		c.Error(err)
 		return
 	}
 	r := accessPolicyCollection{}
 	err = ape.httpClient.DoRequestAndParseResponse(req, &r)
 	if err != nil {
-		utils.SendError(resp, err, http.StatusInternalServerError)
+		c.Error(err)
 		return
 	}
 
-	utils.WriteAsJSON(r, resp)
+	utils.WriteAsJSON(r, c.Writer)
 }
 
 // AddRoutesForAccessPolicies attaches access policies endpoints to router

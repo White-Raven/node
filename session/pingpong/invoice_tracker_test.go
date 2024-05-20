@@ -19,7 +19,6 @@ package pingpong
 
 import (
 	"encoding/hex"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"strings"
@@ -34,13 +33,16 @@ import (
 	"github.com/mysteriumnetwork/node/session"
 	"github.com/mysteriumnetwork/node/session/mbtime"
 	"github.com/mysteriumnetwork/payments/crypto"
+	"github.com/mysteriumnetwork/payments/observer"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 )
 
-const mockRegistryAddress = "0xE6b3a5c92e7c1f9543A0aEE9A93fE2F6B584c1f7"
-const mockHermesAddress = "0xf28DB7aDf64A2811202B149aa4733A1FB9100e5c"
-const mockChannelImplementation = "0xa26b684d8dBa935DD34544FBd3Ab4d7FDe1C4D07"
+const (
+	mockRegistryAddress       = "0xE6b3a5c92e7c1f9543A0aEE9A93fE2F6B584c1f7"
+	mockHermesAddress         = "0xf28DB7aDf64A2811202B149aa4733A1FB9100e5c"
+	mockChannelImplementation = "0xa26b684d8dBa935DD34544FBd3Ab4d7FDe1C4D07"
+)
 
 type MockPeerInvoiceSender struct {
 	mockError     error
@@ -74,7 +76,7 @@ func (mac *mockHermesCaller) UpdatePromiseFee(promise crypto.Promise, newFee *bi
 	return promise, nil
 }
 
-func (mac *mockHermesCaller) GetConsumerData(chainID int64, id string) (HermesUserInfo, error) {
+func (mac *mockHermesCaller) GetConsumerData(chainID int64, id string, cacheTime time.Duration) (HermesUserInfo, error) {
 	return HermesUserInfo{}, nil
 }
 
@@ -86,8 +88,12 @@ func (mac *mockHermesCaller) SyncProviderPromise(promise crypto.Promise, signer 
 	return nil
 }
 
+func (mac *mockHermesCaller) RefreshLatestProviderPromise(chainID int64, id string, hashlock, recoveryData []byte, signer identity.Signer) (crypto.Promise, error) {
+	return crypto.Promise{}, nil
+}
+
 func Test_InvoiceTracker_Start_Stop(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -115,6 +121,8 @@ func Test_InvoiceTracker_Start_Stop(t *testing.T) {
 		TimeTracker:                &tracker,
 		ChargePeriod:               time.Nanosecond,
 		ChargePeriodLeeway:         15 * time.Minute,
+		LimitChargePeriod:          time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
 		ExchangeMessageChan:        exchangeMessageChan,
 		ExchangeMessageWaitTimeout: time.Second,
 		ProviderID:                 identity.FromAddress(acc.Address.Hex()),
@@ -134,7 +142,7 @@ func Test_InvoiceTracker_Start_Stop(t *testing.T) {
 }
 
 func Test_InvoiceTracker_Start_RefusesLargeFee(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -160,6 +168,8 @@ func Test_InvoiceTracker_Start_RefusesLargeFee(t *testing.T) {
 		InvoiceStorage:             invoiceStorage,
 		TimeTracker:                &tracker,
 		ChargePeriod:               time.Nanosecond,
+		LimitChargePeriod:          time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
 		ExchangeMessageChan:        exchangeMessageChan,
 		ExchangeMessageWaitTimeout: time.Second,
 		ProviderID:                 identity.FromAddress(acc.Address.Hex()),
@@ -181,7 +191,7 @@ func Test_InvoiceTracker_Start_RefusesLargeFee(t *testing.T) {
 }
 
 func Test_InvoiceTracker_Start_BubblesHermesCheckError(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -210,6 +220,8 @@ func Test_InvoiceTracker_Start_BubblesHermesCheckError(t *testing.T) {
 		TimeTracker:                &tracker,
 		ChargePeriod:               time.Nanosecond,
 		ChargePeriodLeeway:         15 * time.Minute,
+		LimitChargePeriod:          time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
 		ExchangeMessageChan:        exchangeMessageChan,
 		ExchangeMessageWaitTimeout: time.Second,
 		ProviderID:                 identity.FromAddress(acc.Address.Hex()),
@@ -230,7 +242,7 @@ func Test_InvoiceTracker_Start_BubblesHermesCheckError(t *testing.T) {
 }
 
 func Test_InvoiceTracker_BubblesErrors(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -255,6 +267,8 @@ func Test_InvoiceTracker_BubblesErrors(t *testing.T) {
 		PeerInvoiceSender:          mockSender,
 		InvoiceStorage:             invoiceStorage,
 		TimeTracker:                &tracker,
+		LimitChargePeriod:          time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
 		ChargePeriod:               time.Millisecond,
 		ChargePeriodLeeway:         15 * time.Minute,
 		ExchangeMessageChan:        exchangeMessageChan,
@@ -285,7 +299,7 @@ func Test_InvoiceTracker_BubblesErrors(t *testing.T) {
 }
 
 func Test_InvoiceTracker_SendsInvoice(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -309,7 +323,10 @@ func Test_InvoiceTracker_SendsInvoice(t *testing.T) {
 		PeerInvoiceSender:          mockSender,
 		InvoiceStorage:             invoiceStorage,
 		TimeTracker:                &tracker,
+		LimitChargePeriod:          time.Nanosecond,
 		ChargePeriod:               time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
+		MaxNotPaidInvoice:          big.NewInt(0),
 		ChargePeriodLeeway:         15 * time.Minute,
 		ExchangeMessageChan:        exchangeMessageChan,
 		ExchangeMessageWaitTimeout: time.Second,
@@ -335,7 +352,7 @@ func Test_InvoiceTracker_SendsInvoice(t *testing.T) {
 }
 
 func Test_InvoiceTracker_FirstInvoice_Has_Static_Value(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -359,6 +376,8 @@ func Test_InvoiceTracker_FirstInvoice_Has_Static_Value(t *testing.T) {
 		PeerInvoiceSender:          mockSender,
 		InvoiceStorage:             invoiceStorage,
 		TimeTracker:                &tracker,
+		LimitChargePeriod:          time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
 		ChargePeriod:               time.Nanosecond,
 		ChargePeriodLeeway:         15 * time.Minute,
 		ExchangeMessageChan:        exchangeMessageChan,
@@ -385,7 +404,7 @@ func Test_InvoiceTracker_FirstInvoice_Has_Static_Value(t *testing.T) {
 }
 
 func Test_InvoiceTracker_FreeServiceSendsInvoices(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -409,6 +428,8 @@ func Test_InvoiceTracker_FreeServiceSendsInvoices(t *testing.T) {
 		PeerInvoiceSender:          mockSender,
 		InvoiceStorage:             invoiceStorage,
 		TimeTracker:                &tracker,
+		LimitChargePeriod:          time.Nanosecond,
+		LimitNotPaidInvoice:        big.NewInt(0),
 		ChargePeriod:               time.Nanosecond,
 		ChargePeriodLeeway:         15 * time.Second,
 		ExchangeMessageChan:        exchangeMessageChan,
@@ -461,11 +482,13 @@ func Test_sendsInvoiceIfTimePassed(t *testing.T) {
 	tracker := session.NewTracker(mbtime.Now)
 	tracker.StartTracking()
 	deps := InvoiceTrackerDeps{
-		TimeTracker:       &tracker,
-		EventBus:          mocks.NewEventBus(),
-		AgreedPrice:       *market.NewPrice(600, 0),
-		MaxNotPaidInvoice: big.NewInt(100),
-		ChargePeriod:      time.Millisecond,
+		TimeTracker:         &tracker,
+		EventBus:            mocks.NewEventBus(),
+		AgreedPrice:         *market.NewPrice(600, 0),
+		MaxNotPaidInvoice:   big.NewInt(100),
+		ChargePeriod:        time.Millisecond * 2,
+		LimitChargePeriod:   time.Millisecond * 3,
+		LimitNotPaidInvoice: big.NewInt(0),
 	}
 	invoiceTracker := NewInvoiceTracker(deps)
 	invoiceTracker.dataTransferred = DataTransferred{
@@ -473,12 +496,61 @@ func Test_sendsInvoiceIfTimePassed(t *testing.T) {
 		Down: 1,
 	}
 	invoiceTracker.invoiceDebounceRate = time.Nanosecond
-	defer invoiceTracker.Stop()
 
-	go invoiceTracker.sendInvoicesWhenNeeded(time.Millisecond * 5)
+	wait := make(chan struct{}, 0)
+	go func() {
+		defer close(wait)
+		invoiceTracker.sendInvoicesWhenNeeded(time.Millisecond * 5)
+	}()
 
 	res := <-invoiceTracker.invoiceChannel
 	assert.False(t, res)
+	res = <-invoiceTracker.invoiceChannel
+	assert.False(t, res)
+	invoiceTracker.Stop()
+
+	<-wait
+	// Test that MaxUnpaid and ChargePeriod Increased
+	assert.Equal(t, time.Millisecond*3, invoiceTracker.deps.ChargePeriod, "charge period should increase up to limit")
+
+}
+
+func Test_sendsInvoiceIfDataUsed(t *testing.T) {
+	tracker := session.NewTracker(mbtime.Now)
+	tracker.StartTracking()
+	deps := InvoiceTrackerDeps{
+		TimeTracker:         &tracker,
+		EventBus:            mocks.NewEventBus(),
+		AgreedPrice:         *market.NewPrice(600, 100),
+		MaxNotPaidInvoice:   big.NewInt(100),
+		ChargePeriod:        time.Millisecond * 2,
+		LimitChargePeriod:   time.Millisecond * 3,
+		LimitNotPaidInvoice: big.NewInt(140),
+	}
+	invoiceTracker := NewInvoiceTracker(deps)
+	invoiceTracker.invoiceDebounceRate = time.Nanosecond
+	invoiceTracker.dataTransferred = DataTransferred{
+		Up:   1000000000,
+		Down: 1000000000,
+	}
+	invoiceTracker.invoiceDebounceRate = time.Millisecond * 1
+
+	wait := make(chan struct{}, 0)
+	go func() {
+		defer close(wait)
+		invoiceTracker.sendInvoicesWhenNeeded(time.Millisecond * 5)
+	}()
+
+	res := <-invoiceTracker.invoiceChannel
+	assert.True(t, res)
+	res = <-invoiceTracker.invoiceChannel
+	assert.True(t, res)
+	invoiceTracker.Stop()
+
+	<-wait
+	// Test that MaxUnpaid and ChargePeriod Increased
+	assert.Equal(t, big.NewInt(140), invoiceTracker.deps.MaxNotPaidInvoice, "max unpaid invoice should increase up to limit")
+
 }
 
 func Test_calculateMaxNotReceivedExchangeMessageCount(t *testing.T) {
@@ -491,7 +563,7 @@ func Test_calculateMaxNotReceivedExchangeMessageCount(t *testing.T) {
 }
 
 func generateExchangeMessage(t *testing.T, amount *big.Int, invoice crypto.Invoice, channel string) (crypto.ExchangeMessage, string) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -517,7 +589,7 @@ func generateExchangeMessage(t *testing.T, amount *big.Int, invoice crypto.Invoi
 }
 
 func TestInvoiceTracker_receiveExchangeMessageOrTimeout(t *testing.T) {
-	dir, err := ioutil.TempDir("", "invoice_tracker_test")
+	dir, err := os.MkdirTemp("", "invoice_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -640,6 +712,8 @@ func TestInvoiceTracker_receiveExchangeMessageOrTimeout(t *testing.T) {
 				InvoiceStorage:             NewProviderInvoiceStorage(NewInvoiceStorage(bolt)),
 				AddressProvider:            tt.fields.addressProvider,
 				AgreedPrice:                *market.NewPrice(0, 0),
+				LimitChargePeriod:          time.Nanosecond,
+				LimitNotPaidInvoice:        big.NewInt(0),
 			}
 			it := &InvoiceTracker{
 				hermesFailureCount:  tt.fields.hermesFailureCount,
@@ -717,6 +791,8 @@ func TestInvoiceTracker_handleHermesError(t *testing.T) {
 			it := &InvoiceTracker{
 				deps: InvoiceTrackerDeps{
 					MaxHermesFailureCount: tt.maxHermesFailureCount,
+					LimitChargePeriod:     time.Nanosecond,
+					LimitNotPaidInvoice:   big.NewInt(0),
 				},
 			}
 			err := it.handleHermesError(tt.err)
@@ -783,12 +859,32 @@ func (mp *mockPublisher) Publish(topic string, payload interface{}) {
 func (mp *mockPublisher) Subscribe(topic string, fn interface{}) error {
 	return nil
 }
+
+func (mp *mockPublisher) SubscribeWithUID(topic, uid string, fn interface{}) error {
+	return nil
+}
+
 func (mp *mockPublisher) SubscribeAsync(topic string, fn interface{}) error {
 	return nil
 }
 
 func (mp *mockPublisher) Unsubscribe(topic string, fn interface{}) error {
 	return nil
+}
+
+func (mp *mockPublisher) UnsubscribeWithUID(topic, uid string, fn interface{}) error {
+	return nil
+}
+
+type mockObserver struct {
+}
+
+func (mo *mockObserver) GetHermeses(f *observer.HermesFilter) (observer.HermesesResponse, error) {
+	return observer.HermesesResponse{}, nil
+}
+
+func (mo *mockObserver) GetHermesData(chainId int64, hermesAddress common.Address) (*observer.HermesResponse, error) {
+	return nil, nil
 }
 
 func TestInvoiceTracker_validateExchangeMessage(t *testing.T) {

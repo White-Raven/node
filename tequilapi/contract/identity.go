@@ -18,11 +18,12 @@
 package contract
 
 import (
-	"errors"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/identity"
-	"github.com/mysteriumnetwork/node/tequilapi/validation"
+	pingpong_event "github.com/mysteriumnetwork/node/session/pingpong/event"
 )
 
 // IdentityRefDTO represents unique identity reference.
@@ -37,7 +38,8 @@ type IdentityRefDTO struct {
 // BalanceDTO holds balance information.
 // swagger:model BalanceDTO
 type BalanceDTO struct {
-	Balance *big.Int
+	Balance       *big.Int `json:"balance"`
+	BalanceTokens Tokens   `json:"balance_tokens"`
 }
 
 // IdentityDTO holds identity information.
@@ -46,15 +48,43 @@ type IdentityDTO struct {
 	// identity in Ethereum address format
 	// required: true
 	// example: 0x0000000000000000000000000000000000000001
-	Address            string   `json:"id"`
-	RegistrationStatus string   `json:"registration_status"`
-	ChannelAddress     string   `json:"channel_address"`
-	Balance            *big.Int `json:"balance"`
-	BalanceTokens      Tokens   `json:"balance_tokens"`
-	Earnings           *big.Int `json:"earnings"`
-	EarningsTotal      *big.Int `json:"earnings_total"`
-	Stake              *big.Int `json:"stake"`
-	HermesID           string   `json:"hermes_id"`
+	Address            string `json:"id"`
+	RegistrationStatus string `json:"registration_status"`
+	ChannelAddress     string `json:"channel_address"`
+
+	// deprecated
+	Balance       *big.Int `json:"balance"`
+	Earnings      *big.Int `json:"earnings"`
+	EarningsTotal *big.Int `json:"earnings_total"`
+	// ===========
+
+	BalanceTokens       Tokens `json:"balance_tokens"`
+	EarningsTokens      Tokens `json:"earnings_tokens"`
+	EarningsTotalTokens Tokens `json:"earnings_total_tokens"`
+
+	Stake             *big.Int               `json:"stake"`
+	HermesID          string                 `json:"hermes_id"`
+	EarningsPerHermes map[string]EarningsDTO `json:"earnings_per_hermes"`
+}
+
+// EarningsDTO holds earnings data.
+// swagger:model EarningsDTO
+type EarningsDTO struct {
+	Earnings      Tokens `json:"earnings"`
+	EarningsTotal Tokens `json:"earnings_total"`
+}
+
+// NewEarningsPerHermesDTO transforms the pingong value in a public one.
+func NewEarningsPerHermesDTO(earnings map[common.Address]pingpong_event.Earnings) map[string]EarningsDTO {
+	settlementsPerHermes := make(map[string]EarningsDTO)
+	for h, earn := range earnings {
+		settlementsPerHermes[h.Hex()] = EarningsDTO{
+			Earnings:      NewTokens(earn.UnsettledBalance),
+			EarningsTotal: NewTokens(earn.LifetimeBalance),
+		}
+	}
+
+	return settlementsPerHermes
 }
 
 // NewIdentityDTO maps to API identity.
@@ -86,12 +116,12 @@ type IdentityCreateRequest struct {
 }
 
 // Validate validates fields in request
-func (r IdentityCreateRequest) Validate() *validation.FieldErrorMap {
-	errors := validation.NewErrorMap()
+func (r IdentityCreateRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
 	if r.Passphrase == nil {
-		errors.ForField("passphrase").Required()
+		v.Required("passphrase")
 	}
-	return errors
+	return v.Err()
 }
 
 // IdentityUnlockRequest request used for identity unlocking.
@@ -101,12 +131,12 @@ type IdentityUnlockRequest struct {
 }
 
 // Validate validates fields in request
-func (r IdentityUnlockRequest) Validate() *validation.FieldErrorMap {
-	errors := validation.NewErrorMap()
+func (r IdentityUnlockRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
 	if r.Passphrase == nil {
-		errors.ForField("passphrase").Required()
+		v.Required("passphrase")
 	}
-	return errors
+	return v.Err()
 }
 
 // IdentityCurrentRequest request used for current identity remembering.
@@ -117,12 +147,12 @@ type IdentityCurrentRequest struct {
 }
 
 // Validate validates fields in request
-func (r IdentityCurrentRequest) Validate() *validation.FieldErrorMap {
-	errors := validation.NewErrorMap()
+func (r IdentityCurrentRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
 	if r.Passphrase == nil {
-		errors.ForField("passphrase").Required()
+		v.Required("passphrase")
 	}
-	return errors
+	return v.Err()
 }
 
 // IdentityRegisterRequest represents the identity registration user input parameters
@@ -130,6 +160,10 @@ func (r IdentityCurrentRequest) Validate() *validation.FieldErrorMap {
 type IdentityRegisterRequest struct {
 	// Token: referral token, if the user has one
 	ReferralToken *string `json:"referral_token,omitempty"`
+	// Beneficiary: beneficiary to set during registration. Optional.
+	Beneficiary string `json:"beneficiary,omitempty"`
+	// Fee: an agreed amount to pay for registration
+	Fee *big.Int `json:"fee"`
 }
 
 // IdentityRegistrationResponse represents registration status and needed data for registering of given identity
@@ -143,11 +177,12 @@ type IdentityRegistrationResponse struct {
 // IdentityBeneficiaryResponse represents the provider beneficiary address.
 // swagger:model IdentityBeneficiaryResponseDTO
 type IdentityBeneficiaryResponse struct {
-	Beneficiary string `json:"beneficiary"`
+	Beneficiary      string `json:"beneficiary"`
+	IsChannelAddress bool   `json:"is_channel_address"`
 }
 
 // IdentityImportRequest is received in identity import endpoint.
-//swagger:model IdentityImportRequest
+// swagger:model IdentityImportRequest
 type IdentityImportRequest struct {
 	Data              []byte `json:"data"`
 	CurrentPassphrase string `json:"current_passphrase,omitempty"`
@@ -158,13 +193,59 @@ type IdentityImportRequest struct {
 }
 
 // Validate validates the import request.
-func (i *IdentityImportRequest) Validate() error {
+func (i *IdentityImportRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
 	if len(i.CurrentPassphrase) == 0 {
-		return errors.New("current_passphrase must be provided")
+		v.Required("current_passphrase")
 	}
 	if len(i.Data) == 0 {
-		return errors.New("data must be provided")
+		v.Required("data")
 	}
+	return v.Err()
+}
 
-	return nil
+// IdentityExportRequest is received in identity export endpoint.
+// swagger:model IdentityExportRequestDTO
+type IdentityExportRequest struct {
+	Identity      string `json:"identity,omitempty"`
+	NewPassphrase string `json:"newpassphrase,omitempty"`
+}
+
+// Validate validates the Export request.
+func (i *IdentityExportRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
+	if len(i.NewPassphrase) == 0 {
+		v.Required("newpassphrase")
+	}
+	return v.Err()
+}
+
+// borrowed from github.com/ethereum/go-ethereum@v1.10.17/accounts/keystore/key.go
+
+// EncryptedKeyJSON represents response to IdentityExportRequest.
+// swagger:model IdentityExportResponseDTO
+type EncryptedKeyJSON struct {
+	Address string     `json:"address"`
+	Crypto  cryptoJSON `json:"crypto"`
+	Id      string     `json:"id"`
+	Version int        `json:"version"`
+}
+
+type cryptoJSON struct {
+	Cipher       string                 `json:"cipher"`
+	CipherText   string                 `json:"ciphertext"`
+	CipherParams cipherparamsJSON       `json:"cipherparams"`
+	KDF          string                 `json:"kdf"`
+	KDFParams    map[string]interface{} `json:"kdfparams"`
+	MAC          string                 `json:"mac"`
+}
+
+type cipherparamsJSON struct {
+	IV string `json:"iv"`
+}
+
+// BeneficiaryAddressRequest address of the beneficiary
+// swagger:model BeneficiaryAddressRequest
+type BeneficiaryAddressRequest struct {
+	Address string `json:"address"`
 }

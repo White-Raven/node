@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -41,9 +42,10 @@ func NewRunner(composeFiles []string, testEnv, services string) (runner *Runner,
 	args = append(args, "-p", testEnv)
 
 	runner = &Runner{
-		compose:  sh.RunCmd("docker-compose", args...),
-		testEnv:  testEnv,
-		services: services,
+		compose:    sh.RunCmd("docker-compose", args...),
+		composeOut: sh.OutCmd("docker-compose", args...),
+		testEnv:    testEnv,
+		services:   services,
 	}
 	return runner, runner.cleanup
 }
@@ -51,21 +53,30 @@ func NewRunner(composeFiles []string, testEnv, services string) (runner *Runner,
 // Runner is e2e tests runner responsible for starting test environment and running e2e tests.
 type Runner struct {
 	compose         func(args ...string) error
+	composeOut      func(args ...string) (string, error)
 	etherPassphrase string
 	testEnv         string
 	services        string
 }
 
 // Test starts given provider and consumer nodes and runs e2e tests.
-func (r *Runner) Test(providerHost string) error {
+func (r *Runner) Test(providerHost string) (retErr error) {
 	services := strings.Split(r.services, ",")
 	if err := r.startProviderConsumerNodes(providerHost, services); err != nil {
-		return err
+		retErr = errors.Wrap(err, "tests failed!")
+		return
 	}
 
 	defer func() {
 		if err := r.stopProviderConsumerNodes(providerHost, services); err != nil {
 			log.Err(err).Msg("Could not stop provider consumer nodes")
+		}
+
+		if retErr == nil { // check public IPs in logs only if all the tests succeeded
+			if err := r.checkPublicIPInLogs("myst-provider", "myst-consumer-wireguard"); err != nil {
+				retErr = errors.Wrap(err, "tests failed!")
+				return
+			}
 		}
 	}()
 
@@ -78,7 +89,39 @@ func (r *Runner) Test(providerHost string) error {
 		"-consumer.tequilapi-port=4050",
 		"-consumer.services", r.services,
 	)
-	return errors.Wrap(err, "tests failed!")
+
+	retErr = errors.Wrap(err, "tests failed!")
+	return
+}
+
+func (r *Runner) checkPublicIPInLogs(containers ...string) error {
+	regExps := []*regexp.Regexp{
+		regexp.MustCompile(`(^|[^0-9])(172\.30\.0\.2)($|[^0-9])`),
+		regexp.MustCompile(`(^|[^0-9])(172\.31\.0\.2)($|[^0-9])`),
+	}
+
+	for _, containerName := range containers {
+		output, err := r.composeOut("logs", containerName)
+		if err != nil {
+			log.Err(err).Msgf("Could not get logs of %s container", containerName)
+			continue
+		}
+
+		if len(output) == 0 {
+			log.Error().Msgf("Could not get logs of %s container. Empty data", containerName)
+			continue
+		}
+
+		for _, reg := range regExps {
+			if reg.MatchString(output) {
+				// it will be easier to locate the place if we print the output
+				log.Warn().Msgf("output from %s container's logs:\n%s", containerName, output)
+				return fmt.Errorf("found public IP address by regular expression %s in %s container's logs", reg.String(), containerName)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (r *Runner) cleanup() {
@@ -97,12 +140,7 @@ func (r *Runner) Init() error {
 		return errors.Wrap(err, "could not pull images")
 	}
 
-	log.Info().Msg("building runner")
-	if err := r.compose("build", "go-runner"); err != nil {
-		return errors.Wrap(err, "could not pull images")
-	}
-
-	if err := r.compose("up", "-d", "broker", "ganache", "ganache2", "ipify", "morqa", "mongodb", "transactordatabase"); err != nil {
+	if err := r.compose("up", "-d", "broker", "ganache", "ganache2", "ipify", "morqa", "mongodb", "transactordatabase", "pilvytis-mock"); err != nil {
 		return errors.Wrap(err, "starting other services failed!")
 	}
 
@@ -121,7 +159,7 @@ func (r *Runner) Init() error {
 		return errors.Wrap(err, "starting http-mock failed!")
 	}
 
-	log.Info().Msg("Force rebuilding go runner")
+	log.Info().Msg("building runner")
 	if err := r.compose("build", "go-runner"); err != nil {
 		return fmt.Errorf("could not build go runner %w", err)
 	}
@@ -147,8 +185,6 @@ func (r *Runner) Init() error {
 	if err != nil {
 		return errors.Wrap(err, "failed to deploy contracts!")
 	}
-
-	time.Sleep(time.Second * 5)
 
 	log.Info().Msg("Seeding http mock")
 	if err := seedHTTPMock(); err != nil {
@@ -210,7 +246,7 @@ func seedHTTPMock() error {
 	method := "PUT"
 
 	client := &http.Client{
-		Timeout: time.Second * 5,
+		Timeout: time.Second * 10,
 	}
 
 	for _, v := range httpMockExpectations {

@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mysteriumnetwork/terms/terms-go"
+
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/urfave/cli/v2"
@@ -34,7 +36,6 @@ import (
 	"github.com/mysteriumnetwork/node/core/node"
 	"github.com/mysteriumnetwork/node/metadata"
 	"github.com/mysteriumnetwork/node/services"
-	"github.com/mysteriumnetwork/node/services/wireguard"
 	"github.com/mysteriumnetwork/node/tequilapi/client"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
 )
@@ -54,6 +55,11 @@ func NewCommand(licenseCommandName string) *cli.Command {
 			config.ParseFlagsServiceWireguard(ctx)
 			config.ParseFlagsServiceNoop(ctx)
 			config.ParseFlagsNode(ctx)
+
+			if err := config.ValidateWireguardMTUFlag(); err != nil {
+				log.Error().Msg(err.Error())
+				return err
+			}
 
 			if err := hasAcceptedTOS(ctx); err != nil {
 				clio.PrintTOSError(err)
@@ -109,12 +115,11 @@ type serviceCommand struct {
 
 // Run runs a command
 func (sc *serviceCommand) Run(ctx *cli.Context) (err error) {
-	arg := ctx.Args().Get(0)
-	// If no service type specified we are starting wireguard only.
-	// Other services could be started only explicitly.
-	serviceTypes := []string{wireguard.ServiceType}
-	if arg != "" {
-		serviceTypes = strings.Split(arg, ",")
+	serviceTypes := make([]string, 0)
+
+	activeServices := config.Current.GetString(config.FlagActiveServices.Name)
+	if len(activeServices) != 0 {
+		serviceTypes = strings.Split(activeServices, ",")
 	}
 
 	sc.tryRememberTOS(ctx, sc.errorChannel)
@@ -124,6 +129,22 @@ func (sc *serviceCommand) Run(ctx *cli.Context) (err error) {
 	)
 	log.Info().Msgf("Unlocked identity: %v", providerID)
 
+	if config.Current.GetString(config.FlagNodeVersion.Name) == "" {
+
+		// on first version update: enable dvpn service if wireguard service is enabled
+		mapServices := make(map[string]bool, 0)
+		for _, serviceType := range serviceTypes {
+			mapServices[serviceType] = true
+		}
+
+		if mapServices["wireguard"] && !mapServices["dvpn"] {
+			serviceTypes = append(serviceTypes, "dvpn")
+		}
+	}
+	// save the version
+	config.Current.SetUser(config.FlagNodeVersion.Name, metadata.BuildNumber)
+	config.Current.SaveUserConfig()
+
 	for _, serviceType := range serviceTypes {
 		serviceOpts, err := services.GetStartOptions(serviceType)
 		if err != nil {
@@ -132,7 +153,7 @@ func (sc *serviceCommand) Run(ctx *cli.Context) (err error) {
 		startRequest := contract.ServiceStartRequest{
 			ProviderID:     providerID,
 			Type:           serviceType,
-			AccessPolicies: contract.ServiceAccessPolicies{IDs: serviceOpts.AccessPolicyList},
+			AccessPolicies: &contract.ServiceAccessPolicies{IDs: serviceOpts.AccessPolicyList},
 			Options:        serviceOpts,
 		}
 
@@ -166,7 +187,7 @@ func (sc *serviceCommand) tryRememberTOS(ctx *cli.Context, errCh chan error) {
 			if err := sc.tequilapi.UpdateTerms(contract.TermsRequest{
 				AgreedProvider: &t,
 				AgreedConsumer: &t,
-				AgreedVersion:  metadata.CurrentTermsVersion,
+				AgreedVersion:  terms.TermsVersion,
 			}); err == nil {
 				return
 			}
@@ -202,8 +223,8 @@ func hasAcceptedTOS(ctx *cli.Context) error {
 	}
 
 	version := config.Current.GetString(contract.TermsVersion)
-	if version != metadata.CurrentTermsVersion {
-		return fmt.Errorf("You've agreed to terms of use version %s, but version %s is required", version, metadata.CurrentTermsVersion)
+	if version != terms.TermsVersion {
+		return fmt.Errorf("you've agreed to terms of use version %s, but version %s is required", version, terms.TermsVersion)
 	}
 
 	return nil

@@ -31,7 +31,7 @@ import (
 var mockProposal = market.ServiceProposal{
 	ID:            1,
 	Format:        "good format, i like it",
-	Compatibility: 1,
+	Compatibility: 2,
 	ProviderID:    "0x0",
 	ServiceType:   "much service",
 	Location: market.Location{
@@ -174,7 +174,7 @@ type mockPriceInfoProvider struct {
 	errorToReturn error
 }
 
-func (mpip *mockPriceInfoProvider) GetCurrentPrice(nodeType string, country string) (market.Price, error) {
+func (mpip *mockPriceInfoProvider) GetCurrentPrice(nodeType string, country string, serviceType string) (market.Price, error) {
 	return mpip.priceToReturn, mpip.errorToReturn
 }
 

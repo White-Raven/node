@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mysteriumnetwork/payments/exchange"
 	"github.com/urfave/cli/v2"
 
 	"github.com/mysteriumnetwork/node/cmd/commands/cli/clio"
@@ -69,6 +70,16 @@ var (
 		Name:  "token",
 		Usage: "Either a referral or affiliate token which can be used when registering",
 	}
+
+	flagCountry = cli.StringFlag{
+		Name:  "country",
+		Usage: "Country code",
+	}
+
+	flagState = cli.StringFlag{
+		Name:  "state",
+		Usage: "State code",
+	}
 )
 
 // NewCommand function creates license command.
@@ -110,7 +121,7 @@ func NewCommand() *cli.Command {
 			{
 				Name:  "topup",
 				Usage: "Create a new top-up for your account",
-				Flags: []cli.Flag{&flagAmount, &flagCurrency, &flagGateway, &flagGwData},
+				Flags: []cli.Flag{&flagAmount, &flagCurrency, &flagGateway, &flagGwData, &flagCountry, &flagState},
 				Action: func(ctx *cli.Context) error {
 					cmd.topup(ctx)
 					return nil
@@ -192,7 +203,7 @@ func (c *command) topup(ctx *cli.Context) {
 		return
 	}
 
-	gws, err := c.tequilapi.PaymentOrderGateways()
+	gws, err := c.tequilapi.PaymentOrderGateways(exchange.CurrencyMYST)
 	if err != nil {
 		clio.Info("Failed to get enabled gateways and their information")
 	}
@@ -208,7 +219,7 @@ func (c *command) topup(ctx *cli.Context) {
 	amount := ctx.String(flagAmount.Name)
 
 	amountF, err := strconv.ParseFloat(amount, 64)
-	if amountF <= 0 {
+	if err != nil || amountF <= 0 {
 		clio.Warn("Top-up amount is required and must be greater than 0")
 		return
 	}
@@ -226,6 +237,21 @@ func (c *command) topup(ctx *cli.Context) {
 	if !contains(currency, gw.Currencies) {
 		clio.Warn("Given currency cannot be used")
 		clio.Info("Supported currencies are:", strings.Join(gw.Currencies, ", "))
+		return
+	}
+
+	country := ctx.String(flagCountry.Name)
+	if country == "" {
+		clio.Warn("Country is required")
+		return
+	} else if len(country) != 2 {
+		clio.Warn("Country code must be 2 characters long")
+		return
+	}
+
+	state := ctx.String(flagState.Name)
+	if state != "" && len(state) != 2 {
+		clio.Warn("State code must be 2 characters long")
 		return
 	}
 
@@ -264,6 +290,8 @@ func (c *command) topup(ctx *cli.Context) {
 		MystAmount:  amount,
 		PayCurrency: currency,
 		CallerData:  callerData,
+		Country:     country,
+		State:       state,
 	})
 	if err != nil {
 		clio.Error("Failed to create a top-up request, make sure your requested amount is equal or more than 0.0001 BTC")
@@ -308,7 +336,7 @@ func (c *command) parseToken(ctx *cli.Context) *string {
 }
 
 func (c *command) registerIdentity(identity string, token *string) {
-	err := c.tequilapi.RegisterIdentity(identity, token)
+	err := c.tequilapi.RegisterIdentity(identity, "", token)
 	if err != nil {
 		clio.Error("Failed to register the identity")
 		return
@@ -321,7 +349,7 @@ func (c *command) registerIdentity(identity string, token *string) {
 func (c *command) identityIsUnregistered(identityAddress string) (bool, error) {
 	identityStatus, err := c.tequilapi.Identity(identityAddress)
 	if err != nil {
-		return false, errors.New("Failed to get identity status")
+		return false, errors.New("failed to get identity status")
 	}
 
 	return identityStatus.RegistrationStatus == registry.Unregistered.String(), nil

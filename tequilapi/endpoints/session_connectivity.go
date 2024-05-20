@@ -44,16 +44,16 @@ type sessionConnectivityEndpoint struct {
 }
 
 // swagger:operation GET /sessions-connectivity-status ConnectivityStatus
-// ---
-// summary: Returns session connectivity status
-// description: Returns list of session connectivity status
-// responses:
-//   200:
-//     description: List of connectivity statuses
-//     schema:
-//       "$ref": "#/definitions/ConnectivityStatus"
+//
+//	---
+//	summary: Returns session connectivity status
+//	description: Returns list of session connectivity status
+//	responses:
+//	  200:
+//	    description: List of connectivity statuses
+//	    schema:
+//	      "$ref": "#/definitions/ConnectivityStatus"
 func (e *sessionConnectivityEndpoint) List(c *gin.Context) {
-	resp := c.Writer
 	r := sessionConnectivityStatusCollection{
 		Entries: []*sessionConnectivityStatus{},
 	}
@@ -68,7 +68,7 @@ func (e *sessionConnectivityEndpoint) List(c *gin.Context) {
 		})
 	}
 
-	utils.WriteAsJSON(r, resp)
+	utils.WriteAsJSON(r, c.Writer)
 }
 
 // AddRoutesForConnectivityStatus attaches connectivity statuses endpoints to router.

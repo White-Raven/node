@@ -19,7 +19,7 @@ package ip
 
 import (
 	"errors"
-	"io/ioutil"
+	"io"
 	"net"
 	"strings"
 
@@ -30,14 +30,15 @@ import (
 // IPFallbackAddresses represents the various services we can use to fetch our public IP.
 var IPFallbackAddresses = []string{
 	"https://api.ipify.org",
+	"https://ip2location.io/ip",
 	"https://ipinfo.io/ip",
+	"https://api.ipify.org",
 	"https://ifconfig.me",
 	"https://www.trackip.net/ip",
 	"https://checkip.amazonaws.com/",
 	"https://icanhazip.com",
 	"https://ipecho.net/plain",
 	"https://ident.me/",
-	"https://bot.whatismyipaddress.com/",
 	"http://whatismyip.akamai.com/",
 }
 
@@ -65,7 +66,7 @@ func RequestAndParsePlainIPResponse(c *requests.HTTPClient, url string) (string,
 	}
 	defer res.Body.Close()
 
-	r, err := ioutil.ReadAll(res.Body)
+	r, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", err
 	}

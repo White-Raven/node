@@ -27,8 +27,6 @@ import (
 	"strings"
 	"time"
 
-	nattype "github.com/mysteriumnetwork/node/nat"
-
 	"github.com/anmitsu/go-shlex"
 	"github.com/chzyer/readline"
 	"github.com/rs/zerolog/log"
@@ -43,10 +41,12 @@ import (
 	"github.com/mysteriumnetwork/node/datasize"
 	"github.com/mysteriumnetwork/node/metadata"
 	"github.com/mysteriumnetwork/node/money"
+	nattype "github.com/mysteriumnetwork/node/nat"
 	"github.com/mysteriumnetwork/node/services"
 	tequilapi_client "github.com/mysteriumnetwork/node/tequilapi/client"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
 	"github.com/mysteriumnetwork/node/utils"
+	"github.com/mysteriumnetwork/terms/terms-go"
 )
 
 // CommandName is the name which is used to call this command
@@ -124,7 +124,7 @@ const (
 	statusNotConnected        = string(connectionstate.NotConnected)
 )
 
-var errTermsNotAgreed = errors.New("You must agree with provider and consumer terms of use in order to use this command")
+var errTermsNotAgreed = errors.New("you must agree with provider and consumer terms of use in order to use this command")
 
 var versionSummary = metadata.VersionAsSummary(metadata.LicenseCopyright(
 	"type 'license --warranty'",
@@ -149,8 +149,8 @@ func (c *cliApp) handleTOS(ctx *cli.Context) error {
 	}
 
 	version := c.config.GetString(contract.TermsVersion)
-	if version != metadata.CurrentTermsVersion {
-		return fmt.Errorf("You've agreed to terms of use version %s, but version %s is required", version, metadata.CurrentTermsVersion)
+	if version != terms.TermsVersion {
+		return fmt.Errorf("you've agreed to terms of use version %s, but version %s is required", version, terms.TermsVersion)
 	}
 
 	return nil
@@ -161,7 +161,7 @@ func (c *cliApp) acceptTOS() {
 	if err := c.tequilapi.UpdateTerms(contract.TermsRequest{
 		AgreedConsumer: &t,
 		AgreedProvider: &t,
-		AgreedVersion:  metadata.CurrentTermsVersion,
+		AgreedVersion:  terms.TermsVersion,
 	}); err != nil {
 		clio.Info("Failed to save terms of use agreement, you will have to re-agree on next launch")
 	}
@@ -290,6 +290,18 @@ func (c *cliApp) connect(args []string) (err error) {
 	}
 
 	consumerID, providerID, serviceType := args[0], args[1], args[2]
+	migrationStatus, err := c.tequilapi.MigrateHermesStatus(consumerID)
+	if migrationStatus.Status == contract.MigrationStatusRequired {
+		clio.Infof("Hermes migration status: %s\n", migrationStatus.Status)
+		clio.Info("Migration started")
+		err := c.tequilapi.MigrateHermes(consumerID)
+		if err != nil {
+			return err
+		}
+		clio.Info("Migration finished successfully")
+		clio.Info("Try to reconnect")
+		return nil
+	}
 
 	if !services.IsTypeValid(serviceType) {
 		return fmt.Errorf("invalid service type, expected one of: %s", strings.Join(services.Types(), ","))
@@ -363,12 +375,12 @@ func (c *cliApp) mmnApiKey(args []string) (err error) {
 		return fmt.Errorf("failed to set MMN API key: %w", err)
 	}
 
-	clio.Success(fmt.Sprint("MMN API key configured."))
+	clio.Success("MMN API key configured.")
 	return nil
 }
 
 func (c *cliApp) disconnect() (err error) {
-	err = c.tequilapi.ConnectionDestroy()
+	err = c.tequilapi.ConnectionDestroy(0)
 	if err != nil {
 		return err
 	}
@@ -378,7 +390,7 @@ func (c *cliApp) disconnect() (err error) {
 }
 
 func (c *cliApp) status() (err error) {
-	status, err := c.tequilapi.ConnectionStatus()
+	status, err := c.tequilapi.ConnectionStatus(0)
 	if err != nil {
 		clio.Warn(err)
 	} else {
@@ -438,7 +450,7 @@ func (c *cliApp) nodeMonitoringStatus() (err error) {
 
 	clio.Infof("Node Monitoring Status: %q\n", status.Status)
 
-	connStatus, err := c.tequilapi.ConnectionStatus()
+	connStatus, err := c.tequilapi.ConnectionStatus(0)
 	if err != nil {
 		clio.Warn(err)
 		return
@@ -491,7 +503,7 @@ func (c *cliApp) proposals(args []string) (err error) {
 			}
 		}
 
-		msg := fmt.Sprintf("- provider id: %v\ttype: %v\tcountry: %v\taccess policies: %v", proposal.ProviderID, proposal.ServiceType, country, strings.Join(policies, ","))
+		msg := fmt.Sprintf("- provider id: %v\ttype: %v\tcountry: %v\taccess policies: %v\tprovider type: %v", proposal.ProviderID, proposal.ServiceType, country, strings.Join(policies, ","), proposal.Location.IPType)
 
 		if filter == "" ||
 			strings.Contains(proposal.ProviderID, filter) ||
@@ -631,8 +643,6 @@ func newAutocompleter(tequilapi *tequilapi_client.Client, proposals []contract.P
 			readline.PcItem("new"),
 			readline.PcItem("unlock", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
 			readline.PcItem("register", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
-			readline.PcItem("get-payout-address", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
-			readline.PcItem("set-payout-address", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
 			readline.PcItem("beneficiary-status", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
 			readline.PcItem("beneficiary-set", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
 			readline.PcItem("settle", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
@@ -640,6 +650,9 @@ func newAutocompleter(tequilapi *tequilapi_client.Client, proposals []contract.P
 			readline.PcItem("export", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
 			readline.PcItem("import"),
 			readline.PcItem("withdraw", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
+			readline.PcItem("last-withdrawal", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
+			readline.PcItem("migrate-hermes", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
+			readline.PcItem("migrate-hermes-status", readline.PcItemDynamic(getIdentityOptionList(tequilapi))),
 		),
 		readline.PcItem("status"),
 		readline.PcItem(

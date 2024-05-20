@@ -28,8 +28,7 @@ import (
 )
 
 type orderProvider interface {
-	GetPaymentOrders(id identity.Identity) ([]OrderResponse, error)
-	GetPaymentGatewayOrders(id identity.Identity) ([]PaymentOrderResponse, error)
+	GetPaymentGatewayOrders(id identity.Identity) ([]GatewayOrderResponse, error)
 }
 
 type identityProvider interface {
@@ -144,6 +143,9 @@ func (t *StatusTracker) refreshAndUpdate(id identity.Identity) {
 	}
 
 	if len(newOrders) == 0 {
+		if _, ok := t.orders[id.Address]; !ok {
+			t.orders[id.Address] = map[string]OrderSummary{}
+		}
 		return
 	}
 
@@ -181,33 +183,7 @@ func (t *StatusTracker) compareAndUpdate(id identity.Identity, newOrders map[str
 }
 
 func (t *StatusTracker) refresh(id identity.Identity) (map[string]OrderSummary, error) {
-	orders, err := t.api.GetPaymentOrders(id)
-	if err != nil {
-		return nil, err
-	}
-
 	result := make(map[string]OrderSummary)
-	for _, o := range orders {
-		am := 0.0
-		if o.PayAmount != nil {
-			am = *o.PayAmount
-		}
-
-		currency := ""
-		if o.PayCurrency != nil {
-			currency = *o.PayCurrency
-		}
-
-		id := fmt.Sprint(o.ID)
-		result[id] = OrderSummary{
-			ID:              id,
-			IdentityAddress: o.Identity,
-			Status:          o.Status,
-			PayAmount:       fmt.Sprint(am),
-			PayCurrency:     currency,
-		}
-	}
-
 	gwOrders, err := t.api.GetPaymentGatewayOrders(id)
 	if err != nil {
 		return nil, err

@@ -19,17 +19,19 @@ package client
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
 
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
-	"github.com/mysteriumnetwork/node/tequilapi/validation"
+	"github.com/mysteriumnetwork/payments/exchange"
 )
 
 // NewClient returns a new instance of Client
@@ -216,9 +218,10 @@ func (client *Client) GetTransactorFees() (contract.FeesDTO, error) {
 }
 
 // RegisterIdentity registers identity
-func (client *Client) RegisterIdentity(address string, token *string) error {
+func (client *Client) RegisterIdentity(address, beneficiary string, token *string) error {
 	payload := contract.IdentityRegisterRequest{
 		ReferralToken: token,
+		Beneficiary:   beneficiary,
 	}
 
 	response, err := client.http.Post("identities/"+address+"/register", payload)
@@ -234,6 +237,20 @@ func (client *Client) RegisterIdentity(address string, token *string) error {
 	}
 
 	return nil
+}
+
+// GetRegistrationPaymentStatus returns the registration payment status
+func (client *Client) GetRegistrationPaymentStatus(identity string) (contract.RegistrationPaymentResponse, error) {
+	resp := contract.RegistrationPaymentResponse{}
+
+	res, err := client.http.Get(fmt.Sprintf("v2/identities/%s/registration-payment", identity), nil)
+	if err != nil {
+		return resp, err
+	}
+	defer res.Body.Close()
+
+	err = parseResponseJSON(res, &resp)
+	return resp, err
 }
 
 // ConnectionCreate initiates a new connection to a host identified by providerID
@@ -276,8 +293,9 @@ func (client *Client) SmartConnectionCreate(consumerID, hermesID, serviceType st
 }
 
 // ConnectionDestroy terminates current connection
-func (client *Client) ConnectionDestroy() (err error) {
-	response, err := client.http.Delete("connection", nil)
+func (client *Client) ConnectionDestroy(port int) (err error) {
+	url := fmt.Sprintf("connection?%s", url.Values{"id": []string{strconv.Itoa(port)}}.Encode())
+	response, err := client.http.Delete(url, nil)
 	if err != nil {
 		return
 	}
@@ -287,8 +305,10 @@ func (client *Client) ConnectionDestroy() (err error) {
 }
 
 // ConnectionStatistics returns statistics about current connection
-func (client *Client) ConnectionStatistics() (statistics contract.ConnectionStatisticsDTO, err error) {
-	response, err := client.http.Get("connection/statistics", url.Values{})
+func (client *Client) ConnectionStatistics(sessionID ...string) (statistics contract.ConnectionStatisticsDTO, err error) {
+	response, err := client.http.Get("connection/statistics", url.Values{
+		"id": sessionID,
+	})
 	if err != nil {
 		return statistics, err
 	}
@@ -298,9 +318,23 @@ func (client *Client) ConnectionStatistics() (statistics contract.ConnectionStat
 	return statistics, err
 }
 
+// ConnectionTraffic returns traffic information about current connection
+func (client *Client) ConnectionTraffic(sessionID ...string) (traffic contract.ConnectionTrafficDTO, err error) {
+	response, err := client.http.Get("connection/traffic", url.Values{
+		"id": sessionID,
+	})
+	if err != nil {
+		return traffic, err
+	}
+	defer response.Body.Close()
+
+	err = parseResponseJSON(response, &traffic)
+	return traffic, err
+}
+
 // ConnectionStatus returns connection status
-func (client *Client) ConnectionStatus() (status contract.ConnectionInfoDTO, err error) {
-	response, err := client.http.Get("connection", url.Values{})
+func (client *Client) ConnectionStatus(port int) (status contract.ConnectionInfoDTO, err error) {
+	response, err := client.http.Get("connection", url.Values{"id": []string{strconv.Itoa(port)}})
 	if err != nil {
 		return status, err
 	}
@@ -320,6 +354,30 @@ func (client *Client) ConnectionIP() (ip contract.IPDTO, err error) {
 
 	err = parseResponseJSON(response, &ip)
 	return ip, err
+}
+
+// ProxyIP returns public ip of the proxy.
+func (client *Client) ProxyIP(proxyPort int) (ip contract.IPDTO, err error) {
+	response, err := client.http.Get("connection/proxy/ip", url.Values{"port": []string{strconv.Itoa(proxyPort)}})
+	if err != nil {
+		return ip, err
+	}
+	defer response.Body.Close()
+
+	err = parseResponseJSON(response, &ip)
+	return ip, err
+}
+
+// ProxyLocation returns proxy location.
+func (client *Client) ProxyLocation(proxyPort int) (location contract.LocationDTO, err error) {
+	response, err := client.http.Get("connection/proxy/location", url.Values{"port": []string{strconv.Itoa(proxyPort)}})
+	if err != nil {
+		return location, err
+	}
+	defer response.Body.Close()
+
+	err = parseResponseJSON(response, &location)
+	return location, err
 }
 
 // ConnectionLocation returns current location
@@ -422,26 +480,30 @@ func (client *Client) Unlock(identity, passphrase string) error {
 	return nil
 }
 
-// SetPayout registers payout address for identity.
-func (client *Client) SetPayout(identity, ethAddress string) error {
-	path := fmt.Sprintf("identities/%s/payout-address", identity)
-	payload := contract.PayoutAddressRequest{
+// SetBeneficiaryAsync store beneficiary address locally for identity.
+func (client *Client) SetBeneficiaryAsync(identity, ethAddress string) error {
+	path := fmt.Sprintf("identities/%s/beneficiary-async", identity)
+	payload := contract.BeneficiaryAddressRequest{
 		Address: ethAddress,
 	}
 
-	response, err := client.http.Put(path, payload)
+	response, err := client.http.Post(path, payload)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
 
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to save")
+	}
+
 	return nil
 }
 
-// GetPayout gets the current payout address.
-func (client *Client) GetPayout(identity string) (contract.PayoutAddressRequest, error) {
-	path := fmt.Sprintf("identities/%s/payout-address", identity)
-	res := contract.PayoutAddressRequest{}
+// GetBeneficiaryAsync gets locally saved beneficiary address.
+func (client *Client) GetBeneficiaryAsync(identity string) (contract.BeneficiaryAddressRequest, error) {
+	path := fmt.Sprintf("identities/%s/beneficiary-async", identity)
+	res := contract.BeneficiaryAddressRequest{}
 	response, err := client.http.Get(path, nil)
 	if err != nil {
 		return res, err
@@ -617,10 +679,10 @@ func (client *Client) Withdraw(providerID identity.Identity, hermesID, beneficia
 }
 
 // Settle requests the settling of hermes promises
-func (client *Client) Settle(providerID, hermesID identity.Identity, waitForBlockchain bool) error {
+func (client *Client) Settle(providerID identity.Identity, hermesIDs []common.Address, waitForBlockchain bool) error {
 	settleRequest := contract.SettleRequest{
 		ProviderID: providerID.Address,
-		HermesID:   hermesID.Address,
+		HermesIDs:  hermesIDs,
 	}
 
 	path := "transactor/settle/"
@@ -637,7 +699,7 @@ func (client *Client) Settle(providerID, hermesID identity.Identity, waitForBloc
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusAccepted && response.StatusCode != http.StatusOK {
-		return errors.Wrap(err, "could not settle promise")
+		return fmt.Errorf("could not settle promise")
 	}
 	return nil
 }
@@ -687,10 +749,8 @@ func (client *Client) SettleWithBeneficiaryStatus(address string) (res contract.
 // SettleWithBeneficiary set new beneficiary address for the provided identity.
 func (client *Client) SettleWithBeneficiary(address, beneficiary, hermesID string) error {
 	payload := contract.SettleWithBeneficiaryRequest{
-		SettleRequest: contract.SettleRequest{
-			ProviderID: address,
-			HermesID:   hermesID,
-		},
+		ProviderID:  address,
+		HermesID:    hermesID,
 		Beneficiary: beneficiary,
 	}
 	response, err := client.http.Post("identities/"+address+"/beneficiary", payload)
@@ -727,6 +787,58 @@ func (client *Client) DecreaseStake(ID identity.Identity, amount *big.Int) error
 	return nil
 }
 
+// WithdrawalHistory returns latest withdrawals for identity
+func (client *Client) WithdrawalHistory(address string) (res contract.SettlementListResponse, err error) {
+	params := url.Values{
+		"types":       []string{"withdrawal"},
+		"provider_id": []string{address},
+	}
+
+	path := fmt.Sprintf("transactor/settle/history?%s", params.Encode())
+	response, err := client.http.Get(path, nil)
+	if err != nil {
+		return contract.SettlementListResponse{}, err
+	}
+	defer response.Body.Close()
+
+	err = parseResponseJSON(response, &res)
+	return res, err
+}
+
+// MigrateHermes migrate from old to active Hermes
+func (client *Client) MigrateHermes(address string) error {
+	response, err := client.http.Post(fmt.Sprintf("identities/%s/migrate-hermes", address), nil)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("migration error: %s", body)
+	}
+
+	return nil
+}
+
+// MigrateHermesStatus check status of the migration
+func (client *Client) MigrateHermesStatus(address string) (contract.MigrationStatusResponse, error) {
+	var res contract.MigrationStatusResponse
+
+	response, err := client.http.Get(fmt.Sprintf("identities/%s/migrate-hermes/status", address), nil)
+	if err != nil {
+		return res, err
+	}
+	defer response.Body.Close()
+
+	err = parseResponseJSON(response, &res)
+
+	return res, err
+}
+
 // Beneficiary gets beneficiary address for the provided identity.
 func (client *Client) Beneficiary(address string) (res contract.IdentityBeneficiaryResponse, err error) {
 	response, err := client.http.Get("identities/"+address+"/beneficiary", nil)
@@ -742,32 +854,15 @@ func (client *Client) Beneficiary(address string) (res contract.IdentityBenefici
 // SetMMNApiKey sets MMN's API key in config and registers node to MMN
 func (client *Client) SetMMNApiKey(data contract.MMNApiKeyRequest) error {
 	response, err := client.http.Post("mmn/api-key", data)
-
 	// non 200 status codes return a generic error and we can't use it, instead
 	// the response contains validation JSON which we can use to extract the error
-	if err != nil && response == nil {
-		return err
-	}
-
-	defer response.Body.Close()
-
-	if response.StatusCode == 200 {
-		return nil
-	}
-
-	// TODO this should probably be wrapped and moved into the validation package
-	type validationResponse struct {
-		Message string                              `json:"message"`
-		Errors  map[string][]*validation.FieldError `json:"errors"`
-	}
-	res := validationResponse{}
-	err = parseResponseJSON(response, &res)
 	if err != nil {
 		return err
 	}
+	defer response.Body.Close()
 
-	if res.Errors != nil && res.Errors["api_key"] != nil && res.Errors["api_key"][0] != nil {
-		return errors.New((res.Errors["api_key"][0]).Message)
+	if response.StatusCode != 200 {
+		return apierror.Parse(response)
 	}
 
 	return nil
@@ -833,12 +928,14 @@ func (client *Client) OrderInvoice(address identity.Identity, orderID string) ([
 	}
 	defer resp.Body.Close()
 
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 // PaymentOrderGateways returns all possible gateways and their data.
-func (client *Client) PaymentOrderGateways() ([]contract.GatewaysResponse, error) {
-	resp, err := client.http.Get("v2/payment-order-gateways", nil)
+func (client *Client) PaymentOrderGateways(optionsCurrency exchange.Currency) ([]contract.GatewaysResponse, error) {
+	query := url.Values{}
+	query.Set("options_currency", string(optionsCurrency))
+	resp, err := client.http.Get("v2/payment-order-gateways", query)
 	if err != nil {
 		return nil, err
 	}

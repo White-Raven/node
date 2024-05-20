@@ -21,10 +21,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/core/location/locationstate"
 	nodevent "github.com/mysteriumnetwork/node/core/node/event"
-	"github.com/rs/zerolog/log"
 )
 
 // Cache allows us to cache location resolution
@@ -55,7 +56,7 @@ func NewCache(resolver Resolver, pub publisher, expiry time.Duration) *Cache {
 }
 
 func (c *Cache) needsRefresh() bool {
-	return c.lastFetched.IsZero() || c.lastFetched.After(time.Now().Add(-c.expiry))
+	return c.lastFetched.IsZero() || c.lastFetched.Before(time.Now().Add(-c.expiry))
 }
 
 func (c *Cache) fetchAndSave() (locationstate.Location, error) {
@@ -63,10 +64,15 @@ func (c *Cache) fetchAndSave() (locationstate.Location, error) {
 
 	// on successful fetch save the values for further use
 	if err == nil {
+		ip := loc.IP
+		// avoid printing IP address in logs
+		loc.IP = ""
 		c.pub.Publish(LocUpdateEvent, loc)
+		loc.IP = ip
 		c.location = loc
 		c.lastFetched = time.Now()
 	}
+
 	return loc, err
 }
 
@@ -85,7 +91,13 @@ func (c *Cache) DetectLocation() (locationstate.Location, error) {
 	if !c.needsRefresh() {
 		return c.location, nil
 	}
+
 	return c.fetchAndSave()
+}
+
+// DetectProxyLocation returns the proxy location.
+func (c *Cache) DetectProxyLocation(proxyPort int) (locationstate.Location, error) {
+	return c.locationDetector.DetectProxyLocation(proxyPort)
 }
 
 // HandleConnectionEvent handles connection state change and fetches the location info accordingly.
@@ -97,13 +109,11 @@ func (c *Cache) HandleConnectionEvent(se connectionstate.AppEventConnectionState
 		return
 	}
 
-	loc, err := c.fetchAndSave()
+	_, err := c.fetchAndSave()
 	if err != nil {
 		log.Error().Err(err).Msg("Location update failed")
 		// reset time so a fetch is tried the next time a get is called
 		c.lastFetched = time.Time{}
-	} else {
-		log.Debug().Msgf("Location update succeeded: %v", loc)
 	}
 }
 

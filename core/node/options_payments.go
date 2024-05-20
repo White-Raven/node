@@ -27,16 +27,22 @@ type OptionsPayments struct {
 	MaxAllowedPaymentPercentile    int
 	BCTimeout                      time.Duration
 	HermesPromiseSettlingThreshold float64
+	MaxFeeSettlingThreshold        float64
 	SettlementTimeout              time.Duration
 	SettlementRecheckInterval      time.Duration
 	ConsumerDataLeewayMegabytes    uint64
-	ProviderInvoiceFrequency       time.Duration
-	MaxUnpaidInvoiceValue          *big.Int
 	HermesStatusRecheckInterval    time.Duration
 	BalanceFastPollInterval        time.Duration
 	BalanceFastPollTimeout         time.Duration
 	BalanceLongPollInterval        time.Duration
 	RegistryTransactorPollInterval time.Duration
 	RegistryTransactorPollTimeout  time.Duration
-	ZeroStakeSettlementThreshold   float64
+	MinAutoSettleAmount            float64
+	MaxUnSettledAmount             float64
+
+	ProviderInvoiceFrequency      time.Duration
+	ProviderLimitInvoiceFrequency time.Duration
+
+	MaxUnpaidInvoiceValue   *big.Int
+	LimitUnpaidInvoiceValue *big.Int
 }

@@ -23,39 +23,66 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/session/pingpong/event"
-	"github.com/pkg/errors"
 )
-
-const consumerTotalStorageBucketName = "consumer_promised_totals"
 
 // ConsumerTotalsStorage allows to store total promised amounts for each channel.
 type ConsumerTotalsStorage struct {
-	bolt persistentStorage
-	lock sync.Mutex
-	bus  eventbus.Publisher
+	createLock sync.RWMutex
+	bus        eventbus.Publisher
+	data       map[string]*ConsumerTotalElement
+}
+
+// ConsumerTotalElement stores a grand total promised amount for a single identity, hermes and chain id
+type ConsumerTotalElement struct {
+	lock   sync.RWMutex
+	amount *big.Int
 }
 
 // NewConsumerTotalsStorage creates a new instance of consumer totals storage.
-func NewConsumerTotalsStorage(bolt persistentStorage, bus eventbus.Publisher) *ConsumerTotalsStorage {
+func NewConsumerTotalsStorage(bus eventbus.Publisher) *ConsumerTotalsStorage {
 	return &ConsumerTotalsStorage{
-		bolt: bolt,
 		bus:  bus,
+		data: make(map[string]*ConsumerTotalElement),
 	}
 }
 
 // Store stores the given amount as promised for the given channel.
 func (cts *ConsumerTotalsStorage) Store(chainID int64, id identity.Identity, hermesID common.Address, amount *big.Int) error {
-	cts.lock.Lock()
-	defer cts.lock.Unlock()
+	cts.createLock.Lock()
+	defer cts.createLock.Unlock()
 
 	key := cts.makeKey(chainID, id, hermesID)
-	err := cts.bolt.SetValue(consumerTotalStorageBucketName, key, amount)
-	if err != nil {
-		return err
+	_, ok := cts.data[key]
+	if !ok {
+		_, ok := cts.data[key]
+		if !ok {
+			cts.data[key] = &ConsumerTotalElement{
+				amount: nil,
+			}
+		}
 	}
+	element, ok := cts.data[key]
+	if !ok {
+		return fmt.Errorf("key was not created properly")
+	}
+	element.lock.Lock()
+	defer element.lock.Unlock()
+	if element.amount != nil && element.amount.Cmp(amount) == 1 {
+		log.Warn().Fields(map[string]interface{}{
+			"old_value": element.amount.String(),
+			"new_value": amount.String(),
+			"identity":  id.Address,
+			"chain_id":  chainID,
+			"hermes_id": hermesID.Hex(),
+		}).Msg("tried to save a lower grand total amount")
+		return nil
+	}
+	element.amount = amount
 
 	go cts.bus.Publish(event.AppTopicGrandTotalChanged, event.AppEventGrandTotalChanged{
 		ChainID:    chainID,
@@ -63,26 +90,63 @@ func (cts *ConsumerTotalsStorage) Store(chainID int64, id identity.Identity, her
 		HermesID:   hermesID,
 		ConsumerID: id,
 	})
-
 	return nil
 }
 
 // Get fetches the amount as promised for the given channel.
 func (cts *ConsumerTotalsStorage) Get(chainID int64, id identity.Identity, hermesID common.Address) (*big.Int, error) {
-	cts.lock.Lock()
-	defer cts.lock.Unlock()
-	var res = new(big.Int)
 	key := cts.makeKey(chainID, id, hermesID)
-	err := cts.bolt.GetValue(consumerTotalStorageBucketName, key, &res)
-	if err != nil {
-		// wrap the error to an error we can check for
-		if err.Error() == errBoltNotFound {
-			err = ErrNotFound
-		} else {
-			err = errors.Wrap(err, "could not get total promised")
+	cts.createLock.RLock()
+	defer cts.createLock.RUnlock()
+
+	element, ok := cts.data[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	element.lock.RLock()
+	defer element.lock.RUnlock()
+	res := element.amount
+	if res == nil {
+		return nil, ErrNotFound
+	}
+	return res, nil
+}
+
+// Add adds the given amount as promised for the given channel.
+func (cts *ConsumerTotalsStorage) Add(chainID int64, id identity.Identity, hermesID common.Address, amount *big.Int) error {
+	cts.createLock.Lock()
+	defer cts.createLock.Unlock()
+
+	key := cts.makeKey(chainID, id, hermesID)
+	_, ok := cts.data[key]
+	if !ok {
+		_, ok := cts.data[key]
+		if !ok {
+			cts.data[key] = &ConsumerTotalElement{
+				amount: nil,
+			}
 		}
 	}
-	return res, err
+	element, ok := cts.data[key]
+	if !ok {
+		return fmt.Errorf("key was not created properly")
+	}
+	element.lock.Lock()
+	defer element.lock.Unlock()
+	oldAmount := element.amount
+	if oldAmount == nil {
+		oldAmount = big.NewInt(0)
+	}
+	newAmount := new(big.Int).Add(oldAmount, amount)
+	element.amount = newAmount
+
+	go cts.bus.Publish(event.AppTopicGrandTotalChanged, event.AppEventGrandTotalChanged{
+		ChainID:    chainID,
+		Current:    newAmount,
+		HermesID:   hermesID,
+		ConsumerID: id,
+	})
+	return nil
 }
 
 func (cts *ConsumerTotalsStorage) makeKey(chainID int64, id identity.Identity, hermesID common.Address) string {

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/jinzhu/copier"
 	"github.com/rs/zerolog/log"
 
 	"github.com/mysteriumnetwork/node/consumer/bandwidth"
@@ -31,14 +32,13 @@ import (
 	"github.com/mysteriumnetwork/node/core/discovery/proposal"
 	"github.com/mysteriumnetwork/node/core/service"
 	"github.com/mysteriumnetwork/node/core/service/servicestate"
-	"github.com/mysteriumnetwork/node/core/state/event"
 	stateEvent "github.com/mysteriumnetwork/node/core/state/event"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/identity/registry"
 	"github.com/mysteriumnetwork/node/market"
 	nodeSession "github.com/mysteriumnetwork/node/session"
-	sevent "github.com/mysteriumnetwork/node/session/event"
+	sessionEvent "github.com/mysteriumnetwork/node/session/event"
 	"github.com/mysteriumnetwork/node/session/pingpong"
 	pingpongEvent "github.com/mysteriumnetwork/node/session/pingpong/event"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
@@ -52,7 +52,7 @@ type publisher interface {
 }
 
 type serviceLister interface {
-	List() map[service.ID]*service.Instance
+	List(includeAll bool) []*service.Instance
 }
 
 type identityProvider interface {
@@ -60,7 +60,7 @@ type identityProvider interface {
 }
 
 type channelAddressCalculator interface {
-	GetChannelAddress(chainID int64, id identity.Identity) (common.Address, error)
+	GetActiveChannelAddress(chainID int64, id common.Address) (common.Address, error)
 	GetActiveHermes(chainID int64) (common.Address, error)
 }
 
@@ -70,7 +70,7 @@ type balanceProvider interface {
 
 type earningsProvider interface {
 	List(chainID int64) []pingpong.HermesChannel
-	GetEarnings(chainID int64, id identity.Identity) pingpongEvent.Earnings
+	GetEarningsDetailed(chainID int64, id identity.Identity) *pingpongEvent.EarningsDetailed
 }
 
 // Keeper keeps track of state through eventual consistency.
@@ -114,12 +114,8 @@ type proposalPricer interface {
 func NewKeeper(deps KeeperDeps, debounceDuration time.Duration) *Keeper {
 	k := &Keeper{
 		state: &stateEvent.State{
-			Sessions: make([]session.History, 0),
-			Connection: stateEvent.Connection{
-				Session: connectionstate.Status{
-					State: connectionstate.NotConnected,
-				},
-			},
+			Sessions:    make([]session.History, 0),
+			Connections: make(map[string]stateEvent.Connection),
 		},
 		deps: deps,
 	}
@@ -142,33 +138,33 @@ func NewKeeper(deps KeeperDeps, debounceDuration time.Duration) *Keeper {
 
 func (k *Keeper) fetchIdentities() []stateEvent.Identity {
 	ids := k.deps.IdentityProvider.GetIdentities()
-	identities := make([]event.Identity, len(ids))
+	identities := make([]stateEvent.Identity, len(ids))
 	for idx, id := range ids {
 		status, err := k.deps.IdentityRegistry.GetRegistrationStatus(k.deps.ChainID, id)
 		if err != nil {
 			log.Warn().Err(err).Msgf("Could not get registration status for %s", id.Address)
 			status = registry.Unknown
 		}
-
 		hermesID, err := k.deps.IdentityChannelCalculator.GetActiveHermes(k.deps.ChainID)
 		if err != nil {
 			log.Warn().Err(err).Msgf("Could not retrieve hermesID for %s", id.Address)
 		}
-
-		channelAddress, err := k.deps.IdentityChannelCalculator.GetChannelAddress(k.deps.ChainID, id)
+		channelAddress, err := k.deps.IdentityChannelCalculator.GetActiveChannelAddress(k.deps.ChainID, id.ToCommonAddress())
 		if err != nil {
 			log.Warn().Err(err).Msgf("Could not calculate channel address for %s", id.Address)
 		}
+		earnings := k.deps.EarningsProvider.GetEarningsDetailed(k.deps.ChainID, id)
+		balance := k.deps.BalanceProvider.GetBalance(k.deps.ChainID, id)
 
-		earnings := k.deps.EarningsProvider.GetEarnings(k.deps.ChainID, id)
-		stateIdentity := event.Identity{
+		stateIdentity := stateEvent.Identity{
 			Address:            id.Address,
 			RegistrationStatus: status,
 			ChannelAddress:     channelAddress,
-			Balance:            k.deps.BalanceProvider.GetBalance(k.deps.ChainID, id),
-			Earnings:           earnings.UnsettledBalance,
-			EarningsTotal:      earnings.LifetimeBalance,
+			Balance:            balance,
+			Earnings:           earnings.Total.UnsettledBalance,
+			EarningsTotal:      earnings.Total.LifetimeBalance,
 			HermesID:           hermesID,
+			EarningsPerHermes:  earnings.PerHermes,
 		}
 		identities[idx] = stateIdentity
 	}
@@ -180,13 +176,13 @@ func (k *Keeper) Subscribe(bus eventbus.Subscriber) error {
 	if err := bus.SubscribeAsync(servicestate.AppTopicServiceStatus, k.consumeServiceStateEvent); err != nil {
 		return err
 	}
-	if err := bus.SubscribeAsync(sevent.AppTopicSession, k.consumeServiceSessionEvent); err != nil {
+	if err := bus.SubscribeAsync(sessionEvent.AppTopicSession, k.consumeServiceSessionEvent); err != nil {
 		return err
 	}
-	if err := bus.SubscribeAsync(sevent.AppTopicDataTransferred, k.consumeServiceSessionStatisticsEvent); err != nil {
+	if err := bus.SubscribeAsync(sessionEvent.AppTopicDataTransferred, k.consumeServiceSessionStatisticsEvent); err != nil {
 		return err
 	}
-	if err := bus.SubscribeAsync(sevent.AppTopicTokensEarned, k.consumeServiceSessionEarningsEvent); err != nil {
+	if err := bus.SubscribeAsync(sessionEvent.AppTopicTokensEarned, k.consumeServiceSessionEarningsEvent); err != nil {
 		return err
 	}
 	if err := bus.SubscribeAsync(connectionstate.AppTopicConnectionState, k.consumeConnectionStateEvent); err != nil {
@@ -217,9 +213,15 @@ func (k *Keeper) Subscribe(bus eventbus.Subscriber) error {
 }
 
 func (k *Keeper) announceState(_ interface{}) {
-	k.lock.Lock()
-	defer k.lock.Unlock()
-	k.deps.Publisher.Publish(stateEvent.AppTopicState, *k.state)
+	var state stateEvent.State
+	func() {
+		k.lock.RLock()
+		defer k.lock.RUnlock()
+		if err := copier.CopyWithOption(&state, *k.state, copier.Option{DeepCopy: true}); err != nil {
+			panic(err)
+		}
+	}()
+	k.deps.Publisher.Publish(stateEvent.AppTopicState, state)
 }
 
 func (k *Keeper) updateServiceState(_ interface{}) {
@@ -230,26 +232,31 @@ func (k *Keeper) updateServiceState(_ interface{}) {
 }
 
 func (k *Keeper) updateServices() {
-	services := k.deps.ServiceLister.List()
+	services := k.deps.ServiceLister.List(false)
 	result := make([]contract.ServiceInfoDTO, len(services))
 
 	i := 0
-	for key, v := range services {
+	for _, v := range services {
 		// merge in the connection statistics
-		match, _ := k.getServiceByID(string(key))
+		match, _ := k.getServiceByID(string(v.ID))
 
-		priced, err := k.deps.ProposalPricer.EnrichProposalWithPrice(v.Proposal)
+		proposal := v.CopyProposal()
+		priced, err := k.deps.ProposalPricer.EnrichProposalWithPrice(proposal)
 		if err != nil {
-			log.Warn().Msgf("could not load price for proposal %v(%v)", v.Proposal.ProviderID, v.Proposal.ServiceType)
+			log.Warn().Msgf("could not load price for proposal %v(%v)", proposal.ProviderID, proposal.ServiceType)
 		}
 
+		prop := contract.NewProposalDTO(priced)
+		if match.ConnectionStatistics == nil {
+			match.ConnectionStatistics = &contract.ServiceStatisticsDTO{}
+		}
 		result[i] = contract.ServiceInfoDTO{
-			ID:                   string(key),
+			ID:                   string(v.ID),
 			ProviderID:           v.ProviderID.Address,
 			Type:                 v.Type,
 			Options:              v.Options,
 			Status:               string(v.State()),
-			Proposal:             contract.NewProposalDTO(priced),
+			Proposal:             &prop,
 			ConnectionStatistics: match.ConnectionStatistics,
 		}
 		i++
@@ -270,24 +277,24 @@ func (k *Keeper) getServiceByID(id string) (se contract.ServiceInfoDTO, found bo
 }
 
 // consumeServiceSessionEvent consumes the session change events
-func (k *Keeper) consumeServiceSessionEvent(e sevent.AppEventSession) {
+func (k *Keeper) consumeServiceSessionEvent(e sessionEvent.AppEventSession) {
 	k.lock.Lock()
 	defer k.lock.Unlock()
 
 	switch e.Status {
-	case sevent.CreatedStatus:
+	case sessionEvent.CreatedStatus:
 		k.addSession(e)
 		k.incrementConnectCount(e.Service.ID, false)
-	case sevent.RemovedStatus:
+	case sessionEvent.RemovedStatus:
 		k.removeSession(e)
-	case sevent.AcknowledgedStatus:
+	case sessionEvent.AcknowledgedStatus:
 		k.incrementConnectCount(e.Service.ID, true)
 	}
 
 	go k.announceStateChanges(nil)
 }
 
-func (k *Keeper) addSession(e sevent.AppEventSession) {
+func (k *Keeper) addSession(e sessionEvent.AppEventSession) {
 	k.state.Sessions = append(k.state.Sessions, session.History{
 		SessionID:       nodeSession.ID(e.Session.ID),
 		Direction:       session.DirectionProvided,
@@ -303,7 +310,7 @@ func (k *Keeper) addSession(e sevent.AppEventSession) {
 	})
 }
 
-func (k *Keeper) removeSession(e sevent.AppEventSession) {
+func (k *Keeper) removeSession(e sessionEvent.AppEventSession) {
 	found := false
 	for i := range k.state.Sessions {
 		if string(k.state.Sessions[i].SessionID) == e.Session.ID {
@@ -322,7 +329,7 @@ func (k *Keeper) updateSessionStats(e interface{}) {
 	k.lock.Lock()
 	defer k.lock.Unlock()
 
-	evt, ok := e.(sevent.AppEventDataTransferred)
+	evt, ok := e.(sessionEvent.AppEventDataTransferred)
 	if !ok {
 		log.Warn().Msg("Received a wrong kind of event for session state update")
 		return
@@ -352,7 +359,7 @@ func (k *Keeper) updateSessionEarnings(e interface{}) {
 	k.lock.Lock()
 	defer k.lock.Unlock()
 
-	evt, ok := e.(sevent.AppEventTokensEarned)
+	evt, ok := e.(sessionEvent.AppEventTokensEarned)
 	if !ok {
 		log.Warn().Msg("Received a wrong kind of event for connection state update")
 		return
@@ -383,10 +390,14 @@ func (k *Keeper) consumeConnectionStateEvent(e interface{}) {
 	}
 
 	if evt.State == connectionstate.NotConnected {
-		k.state.Connection = stateEvent.Connection{}
+		delete(k.state.Connections, evt.UUID)
+	} else {
+		conn := k.state.Connections[evt.UUID]
+		conn.Session = evt.SessionInfo
+		k.state.Connections[evt.UUID] = conn
+
+		log.Info().Msgf("Session %s", conn.String())
 	}
-	k.state.Connection.Session = evt.SessionInfo
-	log.Info().Msgf("Session %s", k.state.Connection.String())
 
 	go k.announceStateChanges(nil)
 }
@@ -400,7 +411,9 @@ func (k *Keeper) updateConnectionStats(e interface{}) {
 		return
 	}
 
-	k.state.Connection.Statistics = evt.Stats
+	conn := k.state.Connections[string(evt.UUID)]
+	conn.Statistics = evt.Stats
+	k.state.Connections[evt.UUID] = conn
 
 	go k.announceStateChanges(nil)
 }
@@ -414,7 +427,9 @@ func (k *Keeper) updateConnectionThroughput(e interface{}) {
 		return
 	}
 
-	k.state.Connection.Throughput = evt.Throughput
+	conn := k.state.Connections[evt.UUID]
+	conn.Throughput = evt.Throughput
+	k.state.Connections[evt.UUID] = conn
 
 	go k.announceStateChanges(nil)
 }
@@ -428,8 +443,11 @@ func (k *Keeper) updateConnectionSpending(e interface{}) {
 		return
 	}
 
-	k.state.Connection.Invoice = evt.Invoice
-	log.Info().Msgf("Session %s", k.state.Connection.String())
+	conn := k.state.Connections[evt.UUID]
+	conn.Invoice = evt.Invoice
+	k.state.Connections[evt.UUID] = conn
+
+	log.Info().Msgf("Session %s", conn.String())
 
 	go k.announceStateChanges(nil)
 }
@@ -479,8 +497,10 @@ func (k *Keeper) consumeEarningsChangedEvent(e interface{}) {
 		log.Warn().Msgf("Couldn't find a matching identity for earnings change: %s", evt.Identity.Address)
 		return
 	}
-	id.Earnings = evt.Current.UnsettledBalance
-	id.EarningsTotal = evt.Current.LifetimeBalance
+
+	id.Earnings = evt.Current.Total.UnsettledBalance
+	id.EarningsTotal = evt.Current.Total.LifetimeBalance
+	id.EarningsPerHermes = evt.Current.PerHermes
 
 	go k.announceStateChanges(nil)
 }
@@ -528,11 +548,30 @@ func (k *Keeper) incrementConnectCount(serviceID string, isSuccess bool) {
 }
 
 // GetState returns the current state
-func (k *Keeper) GetState() event.State {
-	k.lock.Lock()
-	defer k.lock.Unlock()
+func (k *Keeper) GetState() (res stateEvent.State) {
+	k.lock.RLock()
+	defer k.lock.RUnlock()
 
-	return *k.state
+	if err := copier.CopyWithOption(&res, *k.state, copier.Option{DeepCopy: true}); err != nil {
+		panic(err)
+	}
+	return
+}
+
+// GetConnection returns the connection state.
+func (k *Keeper) GetConnection(id string) (state stateEvent.Connection) {
+	k.lock.RLock()
+	defer k.lock.RUnlock()
+
+	for _, state := range k.state.Connections {
+		if len(id) == 0 || id == string(state.Session.SessionID) {
+			return state
+		}
+	}
+
+	state.Session.State = connectionstate.NotConnected
+
+	return state
 }
 
 // Debounce takes in the f and makes sure that it only gets called once if multiple calls are executed in the given interval d.

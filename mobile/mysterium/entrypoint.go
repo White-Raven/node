@@ -19,17 +19,19 @@ package mysterium
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
-
-	"github.com/rs/zerolog"
 
 	"github.com/mysteriumnetwork/node/cmd"
 	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/consumer/entertainment"
+	"github.com/mysteriumnetwork/node/consumer/migration"
 	"github.com/mysteriumnetwork/node/core/connection"
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/core/discovery/proposal"
@@ -37,6 +39,8 @@ import (
 	"github.com/mysteriumnetwork/node/core/location"
 	"github.com/mysteriumnetwork/node/core/node"
 	"github.com/mysteriumnetwork/node/core/quality"
+	"github.com/mysteriumnetwork/node/core/service"
+	"github.com/mysteriumnetwork/node/core/service/servicestate"
 	"github.com/mysteriumnetwork/node/core/state"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/feedback"
@@ -44,7 +48,6 @@ import (
 	"github.com/mysteriumnetwork/node/identity/registry"
 	"github.com/mysteriumnetwork/node/identity/selector"
 	"github.com/mysteriumnetwork/node/logconfig"
-	"github.com/mysteriumnetwork/node/market"
 	"github.com/mysteriumnetwork/node/metadata"
 	natprobe "github.com/mysteriumnetwork/node/nat/behavior"
 	"github.com/mysteriumnetwork/node/pilvytis"
@@ -54,7 +57,12 @@ import (
 	wireguard_connection "github.com/mysteriumnetwork/node/services/wireguard/connection"
 	"github.com/mysteriumnetwork/node/session/pingpong"
 	"github.com/mysteriumnetwork/node/session/pingpong/event"
+	pingpongEvent "github.com/mysteriumnetwork/node/session/pingpong/event"
+	paymentClient "github.com/mysteriumnetwork/payments/client"
 	"github.com/mysteriumnetwork/payments/crypto"
+	"github.com/mysteriumnetwork/payments/units"
+
+	"github.com/rs/zerolog"
 )
 
 // MobileNode represents node object tuned for mobile device.
@@ -62,7 +70,7 @@ type MobileNode struct {
 	shutdown                  func() error
 	node                      *cmd.Node
 	stateKeeper               *state.Keeper
-	connectionManager         connection.Manager
+	connectionManager         connection.MultiManager
 	locationResolver          *location.Cache
 	natProber                 natprobe.NATProber
 	identitySelector          selector.Handler
@@ -74,8 +82,9 @@ type MobileNode struct {
 	proposalsManager          *proposalsManager
 	feedbackReporter          *feedback.Reporter
 	transactor                *registry.Transactor
+	affiliator                *registry.Affiliator
 	identityRegistry          registry.IdentityRegistry
-	identityChannelCalculator *pingpong.AddressProvider
+	identityChannelCalculator *paymentClient.MultiChainAddressProvider
 	consumerBalanceTracker    *pingpong.ConsumerBalanceTracker
 	pilvytis                  *pilvytis.API
 	pilvytisOrderIssuer       *pilvytis.OrderIssuer
@@ -85,14 +94,20 @@ type MobileNode struct {
 	entertainmentEstimator    *entertainment.Estimator
 	residentCountry           *identity.ResidentCountry
 	filterPresetStorage       *proposal.FilterPresetStorage
+	hermesMigrator            *migration.HermesMigrator
+	servicesManager           *service.Manager
+	earningsProvider          earningsProvider
+}
+
+type earningsProvider interface {
+	GetEarningsDetailed(chainID int64, id identity.Identity) *pingpongEvent.EarningsDetailed
 }
 
 // MobileNodeOptions contains common mobile node options.
 type MobileNodeOptions struct {
-	Mainnet                        bool
-	Localnet                       bool
+	Network                        string
 	KeepConnectedOnFail            bool
-	MysteriumAPIAddress            string
+	DiscoveryAddress               string
 	BrokerAddresses                []string
 	EtherClientRPCL1               []string
 	EtherClientRPCL2               []string
@@ -101,6 +116,7 @@ type MobileNodeOptions struct {
 	IPDetectorURL                  string
 	LocationDetectorURL            string
 	TransactorEndpointAddress      string
+	AffiliatorEndpointAddress      string
 	HermesEndpointAddress          string
 	Chain1ID                       int64
 	Chain2ID                       int64
@@ -111,6 +127,10 @@ type MobileNodeOptions struct {
 	HermesSCAddress                string
 	ChannelImplementationSCAddress string
 	CacheTTLSeconds                int
+	ObserverAddress                string
+	IsProvider                     bool
+	TequilapiSecured               bool
+	UIFeaturesEnabled              string
 }
 
 // ConsumerPaymentConfig defines consumer side payment configuration
@@ -121,28 +141,57 @@ type ConsumerPaymentConfig struct {
 
 // DefaultNodeOptions returns default options.
 func DefaultNodeOptions() *MobileNodeOptions {
-	return &MobileNodeOptions{
-		Mainnet:                        true,
-		KeepConnectedOnFail:            true,
-		MysteriumAPIAddress:            metadata.MainnetDefinition.MysteriumAPIAddress,
-		BrokerAddresses:                metadata.MainnetDefinition.BrokerAddresses,
-		EtherClientRPCL1:               metadata.MainnetDefinition.Chain1.EtherClientRPC,
-		EtherClientRPCL2:               metadata.MainnetDefinition.Chain2.EtherClientRPC,
-		FeedbackURL:                    "https://feedback.mysterium.network",
-		QualityOracleURL:               "https://quality.mysterium.network/api/v2",
-		IPDetectorURL:                  "https://location.mysterium.network/api/v1/location",
-		LocationDetectorURL:            "https://location.mysterium.network/api/v1/location",
-		TransactorEndpointAddress:      metadata.MainnetDefinition.TransactorAddress,
-		ActiveChainID:                  metadata.MainnetDefinition.DefaultChainID,
-		Chain1ID:                       metadata.MainnetDefinition.Chain1.ChainID,
-		Chain2ID:                       metadata.MainnetDefinition.Chain2.ChainID,
-		PilvytisAddress:                metadata.MainnetDefinition.PilvytisAddress,
-		MystSCAddress:                  metadata.MainnetDefinition.Chain2.MystAddress,
-		RegistrySCAddress:              metadata.MainnetDefinition.Chain2.RegistryAddress,
-		HermesSCAddress:                metadata.MainnetDefinition.Chain2.HermesID,
-		ChannelImplementationSCAddress: metadata.MainnetDefinition.Chain2.ChannelImplAddress,
-		CacheTTLSeconds:                5,
+	return DefaultNodeOptionsByNetwork(string(config.Mainnet))
+}
+
+// DefaultNodeOptionsByNetwork returns default options by network.
+func DefaultNodeOptionsByNetwork(network string) *MobileNodeOptions {
+	options := &MobileNodeOptions{
+		KeepConnectedOnFail: true,
+		FeedbackURL:         "https://feedback.mysterium.network",
+		QualityOracleURL:    "https://quality.mysterium.network/api/v3",
+		IPDetectorURL:       "https://location.mysterium.network/api/v1/location",
+		LocationDetectorURL: "https://location.mysterium.network/api/v1/location",
+		CacheTTLSeconds:     5,
 	}
+
+	bcNetwork, err := config.ParseBlockchainNetwork(network)
+	if err != nil {
+		bcNetwork = config.Mainnet
+	}
+
+	switch bcNetwork {
+	case config.Mainnet:
+		options.Network = string(config.Mainnet)
+		options = setDefinitionOptions(options, metadata.MainnetDefinition)
+	case config.Testnet:
+		options.Network = string(config.Testnet)
+		options = setDefinitionOptions(options, metadata.TestnetDefinition)
+	case config.Localnet:
+		options.Network = string(config.Localnet)
+		options = setDefinitionOptions(options, metadata.LocalnetDefinition)
+	}
+
+	return options
+}
+
+func setDefinitionOptions(options *MobileNodeOptions, definition metadata.NetworkDefinition) *MobileNodeOptions {
+	options.DiscoveryAddress = definition.DiscoveryAddress
+	options.BrokerAddresses = definition.BrokerAddresses
+	options.EtherClientRPCL1 = definition.Chain1.EtherClientRPC
+	options.EtherClientRPCL2 = definition.Chain2.EtherClientRPC
+	options.TransactorEndpointAddress = definition.TransactorAddress
+	options.AffiliatorEndpointAddress = definition.AffiliatorAddress
+	options.ActiveChainID = definition.DefaultChainID
+	options.Chain1ID = definition.Chain1.ChainID
+	options.Chain2ID = definition.Chain2.ChainID
+	options.PilvytisAddress = definition.PilvytisAddress
+	options.MystSCAddress = definition.Chain2.MystAddress
+	options.RegistrySCAddress = definition.Chain2.RegistryAddress
+	options.HermesSCAddress = definition.Chain2.HermesID
+	options.ChannelImplementationSCAddress = definition.Chain2.ChannelImplAddress
+	options.ObserverAddress = definition.ObserverAddress
+	return options
 }
 
 // NewNode function creates new Node.
@@ -154,6 +203,7 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 	}
 
 	dataDir := filepath.Join(appPath, ".mysterium")
+	config.Current.SetDefault(config.FlagDataDir.Name, dataDir)
 	currentDir := appPath
 	if err := loadUserConfig(dataDir); err != nil {
 		return nil, err
@@ -165,15 +215,44 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 	config.Current.SetDefault(config.FlagDefaultCurrency.Name, metadata.DefaultNetwork.DefaultCurrency)
 	config.Current.SetDefault(config.FlagSTUNservers.Name, []string{"stun.l.google.com:19302", "stun1.l.google.com:19302", "stun2.l.google.com:19302"})
 	config.Current.SetDefault(config.FlagUDPListenPorts.Name, "10000:60000")
+	config.Current.SetDefault(config.FlagStatsReportInterval.Name, time.Second)
+	config.Current.SetDefault(config.FlagUIFeatures.Name, options.UIFeaturesEnabled)
+	config.Current.SetDefault(config.FlagActiveServices.Name, "scraping")
+
+	if options.IsProvider {
+		config.Current.SetDefault(config.FlagUserspace.Name, "true")
+		config.Current.SetDefault(config.FlagAgreedTermsConditions.Name, "true")
+		config.Current.SetDefault(config.FlagDiscoveryPingInterval.Name, "3m")
+		config.Current.SetDefault(config.FlagDiscoveryFetchInterval.Name, "3m")
+		config.Current.SetDefault(config.FlagAccessPolicyFetchInterval.Name, "10m")
+		config.Current.SetDefault(config.FlagAccessPolicyFetchingEnabled.Name, "false")
+		config.Current.SetDefault(config.FlagPaymentsZeroStakeUnsettledAmount.Name, "5.0")
+		config.Current.SetDefault(config.FlagShaperBandwidth.Name, "6250")
+
+		config.Current.SetDefault(config.FlagPaymentsProviderInvoiceFrequency.Name, config.FlagPaymentsProviderInvoiceFrequency.Value)
+		config.Current.SetDefault(config.FlagPaymentsLimitProviderInvoiceFrequency.Name, config.FlagPaymentsLimitProviderInvoiceFrequency.Value)
+		config.Current.SetDefault(config.FlagPaymentsUnpaidInvoiceValue.Name, config.FlagPaymentsUnpaidInvoiceValue.Value)
+		config.Current.SetDefault(config.FlagPaymentsLimitUnpaidInvoiceValue.Name, config.FlagPaymentsLimitUnpaidInvoiceValue.Value)
+		config.Current.SetDefault(config.FlagChain1KnownHermeses.Name, config.FlagChain1KnownHermeses.Value)
+		config.Current.SetDefault(config.FlagChain2KnownHermeses.Name, config.FlagChain2KnownHermeses.Value)
+		config.Current.SetDefault(config.FlagDNSListenPort.Name, config.FlagDNSListenPort.Value)
+
+		config.Current.SetDefault(config.FlagUIFeatures.Name, "android_mobile_node,android_sso_deeplink,disableUpdateNotifications")
+	}
+
+	bcNetwork, err := config.ParseBlockchainNetwork(options.Network)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bc network: %w", err)
+	}
+	config.Current.SetDefaultsByNetwork(bcNetwork)
 
 	network := node.OptionsNetwork{
-		Mainnet:             options.Mainnet,
-		Localnet:            options.Localnet,
-		MysteriumAPIAddress: options.MysteriumAPIAddress,
-		BrokerAddresses:     options.BrokerAddresses,
-		EtherClientRPCL1:    options.EtherClientRPCL1,
-		EtherClientRPCL2:    options.EtherClientRPCL2,
-		ChainID:             options.ActiveChainID,
+		Network:          bcNetwork,
+		DiscoveryAddress: options.DiscoveryAddress,
+		BrokerAddresses:  options.BrokerAddresses,
+		EtherClientRPCL1: options.EtherClientRPCL1,
+		EtherClientRPCL2: options.EtherClientRPCL2,
+		ChainID:          options.ActiveChainID,
 		DNSMap: map[string][]string{
 			"location.mysterium.network": {"51.158.129.204"},
 			"quality.mysterium.network":  {"51.158.129.204"},
@@ -186,6 +265,9 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 			},
 		},
 	}
+	if options.IsProvider {
+		network.DNSMap["badupnp.benjojo.co.uk"] = []string{"104.22.70.70", "104.22.71.70", "172.67.25.154"}
+	}
 	logOptions := logconfig.LogOptions{
 		LogLevel: zerolog.DebugLevel,
 		LogHTTP:  false,
@@ -193,6 +275,7 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 	}
 
 	nodeOptions := node.Options{
+		Mobile:     true,
 		LogOptions: logOptions,
 		Directories: node.OptionsDirectory{
 			Data:     dataDir,
@@ -201,13 +284,9 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 			Runtime:  currentDir,
 		},
 
-		TequilapiEnabled:        false,
 		SwarmDialerDNSHeadstart: time.Millisecond * 1500,
 		Keystore: node.OptionsKeystore{
 			UseLightweight: true,
-		},
-		UI: node.OptionsUI{
-			UIEnabled: false,
 		},
 		FeedbackURL:    options.FeedbackURL,
 		OptionsNetwork: network,
@@ -217,7 +296,7 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 		},
 		Discovery: node.OptionsDiscovery{
 			Types:        []node.DiscoveryType{node.DiscoveryTypeAPI},
-			Address:      network.MysteriumAPIAddress,
+			Address:      network.DiscoveryAddress,
 			FetchEnabled: false,
 			DHT: node.OptionsDHT{
 				Address:        "0.0.0.0",
@@ -234,12 +313,12 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 		Transactor: node.OptionsTransactor{
 			TransactorEndpointAddress:       options.TransactorEndpointAddress,
 			ProviderMaxRegistrationAttempts: 10,
-			ProviderRegistrationRetryDelay:  time.Minute * 3,
+			TransactorFeesValidTime:         time.Second * 30,
 		},
+		Affiliator: node.OptionsAffiliator{AffiliatorEndpointAddress: options.AffiliatorEndpointAddress},
 		Payments: node.OptionsPayments{
 			MaxAllowedPaymentPercentile:    1500,
 			BCTimeout:                      time.Second * 30,
-			HermesPromiseSettlingThreshold: 0.1,
 			SettlementTimeout:              time.Hour * 2,
 			HermesStatusRecheckInterval:    time.Hour * 2,
 			BalanceFastPollInterval:        time.Second * 30,
@@ -264,11 +343,55 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 				ChainID:            options.Chain2ID,
 			},
 		},
+
 		Consumer:        true,
 		PilvytisAddress: options.PilvytisAddress,
+		ObserverAddress: options.ObserverAddress,
+		SSE: node.OptionsSSE{
+			Enabled: true,
+		},
+	}
+	if options.IsProvider {
+		nodeOptions.Discovery.FetchEnabled = true
+		nodeOptions.Discovery.PingInterval = config.GetDuration(config.FlagDiscoveryPingInterval)
+		nodeOptions.Discovery.FetchInterval = config.GetDuration(config.FlagDiscoveryFetchInterval)
+		nodeOptions.Payments = node.OptionsPayments{
+			MaxAllowedPaymentPercentile:    3000,
+			BCTimeout:                      time.Second * 30,
+			SettlementTimeout:              time.Minute * 3,
+			SettlementRecheckInterval:      time.Second * 30,
+			HermesPromiseSettlingThreshold: 0.01,
+			MaxFeeSettlingThreshold:        0.05,
+			ConsumerDataLeewayMegabytes:    0x14,
+			MinAutoSettleAmount:            5,
+			MaxUnSettledAmount:             20,
+			HermesStatusRecheckInterval:    time.Hour * 2,
+			BalanceFastPollInterval:        time.Second * 30 * 2,
+			BalanceFastPollTimeout:         time.Minute * 3 * 3,
+			BalanceLongPollInterval:        time.Hour * 1,
+			RegistryTransactorPollInterval: time.Second * 20,
+			RegistryTransactorPollTimeout:  time.Minute * 20,
+			ProviderInvoiceFrequency:       config.GetDuration(config.FlagPaymentsProviderInvoiceFrequency),
+			ProviderLimitInvoiceFrequency:  config.GetDuration(config.FlagPaymentsLimitProviderInvoiceFrequency),
+			MaxUnpaidInvoiceValue:          config.GetBigInt(config.FlagPaymentsUnpaidInvoiceValue),
+			LimitUnpaidInvoiceValue:        config.GetBigInt(config.FlagPaymentsLimitUnpaidInvoiceValue),
+		}
+		nodeOptions.Payments.LimitUnpaidInvoiceValue = config.GetBigInt(config.FlagPaymentsLimitUnpaidInvoiceValue)
+		nodeOptions.Chains.Chain1.KnownHermeses = config.GetStringSlice(config.FlagChain1KnownHermeses)
+		nodeOptions.Chains.Chain1.KnownHermeses = config.GetStringSlice(config.FlagChain2KnownHermeses)
+		nodeOptions.Consumer = false
+		nodeOptions.TequilapiEnabled = options.TequilapiSecured
+		nodeOptions.TequilapiPort = 4050
+		nodeOptions.TequilapiAddress = "127.0.0.1"
+		nodeOptions.TequilapiSecured = options.TequilapiSecured
+		nodeOptions.UI = node.OptionsUI{
+			UIEnabled:     true,
+			UIBindAddress: "127.0.0.1",
+			UIPort:        4449,
+		}
 	}
 
-	err := di.Bootstrap(nodeOptions)
+	err = di.Bootstrap(nodeOptions)
 	if err != nil {
 		return nil, fmt.Errorf("could not bootstrap dependencies: %w", err)
 	}
@@ -277,7 +400,7 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 		shutdown:                  di.Shutdown,
 		node:                      di.Node,
 		stateKeeper:               di.StateKeeper,
-		connectionManager:         di.ConnectionManager,
+		connectionManager:         di.MultiConnectionManager,
 		locationResolver:          di.LocationResolver,
 		natProber:                 di.NATProber,
 		identitySelector:          di.IdentitySelector,
@@ -286,6 +409,7 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 		eventBus:                  di.EventBus,
 		connectionRegistry:        di.ConnectionRegistry,
 		feedbackReporter:          di.Reporter,
+		affiliator:                di.Affiliator,
 		transactor:                di.Transactor,
 		identityRegistry:          di.IdentityRegistry,
 		consumerBalanceTracker:    di.ConsumerBalanceTracker,
@@ -308,6 +432,12 @@ func NewNode(appPath string, options *MobileNodeOptions) (*MobileNode, error) {
 		),
 		residentCountry:     di.ResidentCountry,
 		filterPresetStorage: di.FilterPresetStorage,
+		hermesMigrator:      di.HermesMigrator,
+		earningsProvider:    di.HermesChannelRepository,
+	}
+
+	if options.IsProvider {
+		mobileNode.servicesManager = di.ServicesManager
 	}
 
 	return mobileNode, nil
@@ -356,20 +486,34 @@ func (mb *MobileNode) SetUserConfig(key, value string) error {
 
 // GetStatusResponse represents status response.
 type GetStatusResponse struct {
-	State       string
-	ProviderID  string
-	ServiceType string
+	State    string
+	Proposal proposalDTO
 }
 
 // GetStatus returns current connection state and provider info if connected to VPN.
-func (mb *MobileNode) GetStatus() *GetStatusResponse {
-	status := mb.connectionManager.Status()
+func (mb *MobileNode) GetStatus() ([]byte, error) {
+	status := mb.connectionManager.Status(0)
 
-	return &GetStatusResponse{
-		State:       string(status.State),
-		ProviderID:  status.Proposal.ProviderID,
-		ServiceType: status.Proposal.ServiceType,
+	resp := &GetStatusResponse{
+		State: string(status.State),
+		Proposal: proposalDTO{
+			ProviderID:   status.Proposal.ProviderID,
+			ServiceType:  status.Proposal.ServiceType,
+			Country:      status.Proposal.Location.Country,
+			IPType:       status.Proposal.Location.IPType,
+			QualityLevel: proposalQualityLevel(status.Proposal.Quality.Quality),
+			Price: proposalPrice{
+				Currency: mb.GetDefaultCurrency(),
+			},
+		},
 	}
+
+	if status.Proposal.Price.PricePerGiB != nil && status.Proposal.Price.PricePerHour != nil {
+		resp.Proposal.Price.PerGiB, _ = big.NewFloat(0).SetInt(status.Proposal.Price.PricePerGiB).Float64()
+		resp.Proposal.Price.PerHour, _ = big.NewFloat(0).SetInt(status.Proposal.Price.PricePerHour).Float64()
+	}
+
+	return json.Marshal(resp)
 }
 
 // GetNATType return current NAT type after a probe.
@@ -391,8 +535,9 @@ type StatisticsChangeCallback interface {
 func (mb *MobileNode) RegisterStatisticsChangeCallback(cb StatisticsChangeCallback) {
 	_ = mb.eventBus.SubscribeAsync(connectionstate.AppTopicConnectionStatistics, func(e connectionstate.AppEventConnectionStatistics) {
 		var tokensSpent float64
-		if mb.stateKeeper.GetState().Connection.Invoice.AgreementTotal != nil {
-			tokensSpent = crypto.BigMystToFloat(mb.stateKeeper.GetState().Connection.Invoice.AgreementTotal)
+		agreementTotal := mb.stateKeeper.GetConnection("").Invoice.AgreementTotal
+		if agreementTotal != nil {
+			tokensSpent = units.BigIntWeiToFloatEth(agreementTotal)
 		}
 
 		cb.OnChange(int64(e.SessionInfo.Duration().Seconds()), int64(e.Stats.BytesReceived), int64(e.Stats.BytesSent), tokensSpent)
@@ -404,11 +549,24 @@ type ConnectionStatusChangeCallback interface {
 	OnChange(status string)
 }
 
+// ServiceStatusChangeCallback represents status callback.
+type ServiceStatusChangeCallback interface {
+	OnChange(service string, status string)
+}
+
 // RegisterConnectionStatusChangeCallback registers callback which is called on active connection
 // status change.
 func (mb *MobileNode) RegisterConnectionStatusChangeCallback(cb ConnectionStatusChangeCallback) {
 	_ = mb.eventBus.SubscribeAsync(connectionstate.AppTopicConnectionState, func(e connectionstate.AppEventConnectionState) {
 		cb.OnChange(string(e.State))
+	})
+}
+
+// RegisterServiceStatusChangeCallback registers callback which is called on active connection
+// status change.
+func (mb *MobileNode) RegisterServiceStatusChangeCallback(cb ServiceStatusChangeCallback) {
+	_ = mb.eventBus.SubscribeAsync(servicestate.AppTopicServiceStatus, func(e servicestate.AppEventServiceStatus) {
+		cb.OnChange(e.Type, e.Status)
 	})
 }
 
@@ -433,12 +591,14 @@ func (mb *MobileNode) RegisterBalanceChangeCallback(cb BalanceChangeCallback) {
  *  - "system" uses DNS servers from client's system configuration
  */
 type ConnectRequest struct {
-	IdentityAddress   string
-	ProviderID        string
-	ServiceType       string
-	DNSOption         string
-	DisableKillSwitch bool
-	ForceReconnect    bool
+	Providers               string // comma separated list of providers that will be used for the connection.
+	IdentityAddress         string
+	ServiceType             string
+	CountryCode             string
+	IPType                  string
+	SortBy                  string
+	DNSOption               string
+	IncludeMonitoringFailed bool
 }
 
 func (cr *ConnectRequest) dnsOption() (connection.DNSOption, error) {
@@ -463,17 +623,29 @@ const (
 
 // Connect connects to given provider.
 func (mb *MobileNode) Connect(req *ConnectRequest) *ConnectResponse {
-	proposalLookup := func() (proposal *proposal.PricedServiceProposal, err error) {
-		return mb.proposalsManager.repository.Proposal(market.ProposalID{
-			ProviderID:  req.ProviderID,
-			ServiceType: req.ServiceType,
-		})
+	var providers []string
+	if len(req.Providers) > 0 {
+		providers = strings.Split(req.Providers, ",")
 	}
+
+	f := &proposal.Filter{
+		ServiceType:             req.ServiceType,
+		LocationCountry:         req.CountryCode,
+		ProviderIDs:             providers,
+		IPType:                  req.IPType,
+		IncludeMonitoringFailed: req.IncludeMonitoringFailed,
+		ExcludeUnsupported:      true,
+	}
+
+	proposalLookup := connection.FilteredProposals(f, req.SortBy, mb.proposalsManager.repository)
 
 	qualityEvent := quality.ConnectionEvent{
 		ServiceType: req.ServiceType,
 		ConsumerID:  req.IdentityAddress,
-		ProviderID:  req.ProviderID,
+	}
+
+	if len(req.Providers) == 1 {
+		qualityEvent.ProviderID = providers[0]
 	}
 
 	dnsOption, err := req.dnsOption()
@@ -484,8 +656,7 @@ func (mb *MobileNode) Connect(req *ConnectRequest) *ConnectResponse {
 		}
 	}
 	connectOptions := connection.ConnectParams{
-		DisableKillSwitch: req.DisableKillSwitch,
-		DNS:               dnsOption,
+		DNS: dnsOption,
 	}
 
 	hermes, err := mb.identityChannelCalculator.GetActiveHermes(mb.chainID)
@@ -527,7 +698,7 @@ func (mb *MobileNode) Reconnect(req *ConnectRequest) *ConnectResponse {
 
 // Disconnect disconnects or cancels current connection.
 func (mb *MobileNode) Disconnect() error {
-	if err := mb.connectionManager.Disconnect(); err != nil {
+	if err := mb.connectionManager.Disconnect(0); err != nil {
 		return fmt.Errorf("could not disconnect: %w", err)
 	}
 
@@ -552,6 +723,14 @@ func (mb *MobileNode) GetBalance(req *GetBalanceRequest) (*GetBalanceResponse, e
 	return &GetBalanceResponse{Balance: b}, nil
 }
 
+// GetUnsettledEarnings returns unsettled earnings.
+func (mb *MobileNode) GetUnsettledEarnings(req *GetBalanceRequest) (*GetBalanceResponse, error) {
+	earnings := mb.earningsProvider.GetEarningsDetailed(mb.chainID, identity.FromAddress(req.IdentityAddress))
+	u := crypto.BigMystToFloat(earnings.Total.UnsettledBalance)
+
+	return &GetBalanceResponse{Balance: u}, nil
+}
+
 // ForceBalanceUpdate force updates balance and returns the updated balance.
 func (mb *MobileNode) ForceBalanceUpdate(req *GetBalanceRequest) *GetBalanceResponse {
 	return &GetBalanceResponse{
@@ -567,18 +746,16 @@ type SendFeedbackRequest struct {
 
 // SendFeedback sends user feedback via feedback reported.
 func (mb *MobileNode) SendFeedback(req *SendFeedbackRequest) error {
-	report := feedback.UserReport{
+	report := feedback.BugReport{
 		Email:       req.Email,
 		Description: req.Description,
 	}
 
-	result, err := mb.feedbackReporter.NewIssue(report)
+	_, apierr, err := mb.feedbackReporter.NewIssue(report)
 	if err != nil {
 		return fmt.Errorf("could not create user report: %w", err)
-	}
-
-	if !result.Success {
-		return errors.New("user report sent but got error response")
+	} else if apierr != nil {
+		return fmt.Errorf("could not create user report: %w", apierr)
 	}
 
 	return nil

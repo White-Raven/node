@@ -19,7 +19,6 @@ package versionmanager
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 )
@@ -38,7 +37,7 @@ type NodeUIVersionConfig interface {
 	uiDir() string
 	uiDistPath(versionName string) string
 	uiDistFile(versionName string) string
-	write(w nodeUIVersion)
+	write(w nodeUIVersion) error
 }
 
 // VersionConfig ui version config
@@ -91,7 +90,7 @@ func (vm *VersionConfig) exists() (bool, error) {
 }
 
 func (vm *VersionConfig) read() (nodeUIVersion, error) {
-	data, err := ioutil.ReadFile(vm.whichFilePath())
+	data, err := os.ReadFile(vm.whichFilePath())
 	if err != nil {
 		return nodeUIVersion{}, err
 	}
@@ -122,14 +121,13 @@ func (vm *VersionConfig) uiDistFile(versionName string) string {
 	return filepath.Join(vm.uiDistPath(versionName), nodeUIAssetName)
 }
 
-func (vm *VersionConfig) write(w nodeUIVersion) {
-	json, err := json.Marshal(w)
+func (vm *VersionConfig) write(w nodeUIVersion) error {
+	configJSON, err := json.Marshal(w)
 	if err != nil {
-		return
+		return err
 	}
 
-	err = ioutil.WriteFile(vm.whichFilePath(), json, 0644)
-	return
+	return os.WriteFile(vm.whichFilePath(), configJSON, 0644)
 }
 
 func (vm *VersionConfig) uiDir() string {

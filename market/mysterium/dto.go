@@ -37,8 +37,10 @@ type ProposalsQuery struct {
 
 	IPType                  string
 	NATCompatibility        nat.NATType
+	BandwidthMin            float64
 	QualityMin              float32
 	IncludeMonitoringFailed bool
+	PresetID                int
 }
 
 // ToURLValues converts the query to url.Values.
@@ -72,11 +74,18 @@ func (q ProposalsQuery) ToURLValues() url.Values {
 	if q.AccessPolicySource != "" {
 		values.Set("access_policy_source", q.AccessPolicySource)
 	}
+	if q.BandwidthMin > 0 {
+		values.Set("bandwidth_min", fmt.Sprintf("%.2f", q.BandwidthMin))
+	}
 	if q.QualityMin != 0 {
 		values.Set("quality_min", fmt.Sprintf("%.2f", q.QualityMin))
 	}
 	if q.IncludeMonitoringFailed {
 		values.Set("include_monitoring_failed", fmt.Sprint(q.IncludeMonitoringFailed))
 	}
+	if q.PresetID != 0 {
+		values.Set("preset_id", strconv.Itoa(q.PresetID))
+	}
+
 	return values
 }

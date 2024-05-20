@@ -21,9 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/core/location/locationstate"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestCache_needsRefresh(t *testing.T) {
@@ -45,7 +46,7 @@ func TestCache_needsRefresh(t *testing.T) {
 			name: "returns true if expired",
 			want: true,
 			fields: fields{
-				lastFetched: time.Now().Add(time.Second * -59),
+				lastFetched: time.Now().Add(time.Second * -69),
 				expiry:      time.Minute * 1,
 			},
 		},
@@ -53,7 +54,7 @@ func TestCache_needsRefresh(t *testing.T) {
 			name: "returns false if updated recently",
 			want: false,
 			fields: fields{
-				lastFetched: time.Now().Add(time.Second * -61),
+				lastFetched: time.Now().Add(time.Second * -50),
 				expiry:      time.Minute * 1,
 			},
 		},
@@ -80,6 +81,10 @@ type mockResolver struct {
 func (mr *mockResolver) DetectLocation() (locationstate.Location, error) {
 	mr.called = true
 	return locationstate.Location{}, mr.errToReturn
+}
+
+func (mr *mockResolver) DetectProxyLocation(_ int) (locationstate.Location, error) {
+	return mr.DetectLocation()
 }
 
 type mockPublisher struct{}

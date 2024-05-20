@@ -22,12 +22,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/consumer/bandwidth"
 	"github.com/mysteriumnetwork/node/core/connection"
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/core/quality"
 	"github.com/mysteriumnetwork/node/datasize"
-	"github.com/mysteriumnetwork/node/tequilapi/validation"
 	"github.com/mysteriumnetwork/payments/crypto"
 )
 
@@ -102,6 +102,7 @@ func NewConnectionStatisticsDTO(session connectionstate.Status, statistics conne
 		ThroughputSent:     datasize.BitSize(throughput.Up).Bits(),
 		ThroughputReceived: datasize.BitSize(throughput.Down).Bits(),
 		TokensSpent:        agreementTotal,
+		SpentTokens:        NewTokens(agreementTotal),
 	}
 }
 
@@ -128,6 +129,18 @@ type ConnectionStatisticsDTO struct {
 
 	// example: 500000
 	TokensSpent *big.Int `json:"tokens_spent"`
+
+	SpentTokens Tokens `json:"spent_tokens"`
+}
+
+// ConnectionTrafficDTO holds consumer connection traffic information.
+// swagger:model ConnectionTrafficDTO
+type ConnectionTrafficDTO struct {
+	// example: 1024
+	BytesSent uint64 `json:"bytes_sent"`
+
+	// example: 1024
+	BytesReceived uint64 `json:"bytes_received"`
 }
 
 // ConnectionCreateRequest request used to start a connection.
@@ -171,12 +184,12 @@ type ConnectionCreateFilter struct {
 }
 
 // Validate validates fields in request.
-func (cr ConnectionCreateRequest) Validate() *validation.FieldErrorMap {
-	errs := validation.NewErrorMap()
+func (cr ConnectionCreateRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
 	if len(cr.ConsumerID) == 0 {
-		errs.ForField("consumer_id").Required()
+		v.Required("consumer_id")
 	}
-	return errs
+	return v.Err()
 }
 
 // Event creates a quality connection event to be send as a quality metric.
@@ -203,4 +216,6 @@ type ConnectOptions struct {
 	// default: auto
 	// example: auto, provider, system, "1.1.1.1,8.8.8.8"
 	DNS connection.DNSOption `json:"dns"`
+
+	ProxyPort int `json:"proxy_port"`
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 
+	"github.com/mysteriumnetwork/node/config"
 	wg "github.com/mysteriumnetwork/node/services/wireguard"
 	"github.com/mysteriumnetwork/node/services/wireguard/key"
 	"github.com/mysteriumnetwork/node/services/wireguard/resources"
@@ -32,8 +33,8 @@ import (
 )
 
 // NewConnectionEndpoint returns new connection endpoint instance.
-func NewConnectionEndpoint(resourceAllocator *resources.Allocator) (wg.ConnectionEndpoint, error) {
-	wgClient, err := newWGClient()
+func NewConnectionEndpoint(resourceAllocator *resources.Allocator, wgClientFactory *WgClientFactory) (wg.ConnectionEndpoint, error) {
+	wgClient, err := wgClientFactory.NewWGClient()
 	if err != nil {
 		return nil, err
 	}
@@ -56,10 +57,18 @@ func (ce *connectionEndpoint) StartConsumerMode(cfg wgcfg.DeviceConfig) error {
 	if err := ce.cleanAbandonedInterfaces(); err != nil {
 		return err
 	}
-	iface, err := ce.resourceAllocator.AllocateInterface()
-	if err != nil {
-		return errors.Wrap(err, "could not allocate interface")
+
+	var iface string
+	var err error
+	if cfg.ProxyPort > 0 {
+		iface = fmt.Sprintf("myst%d", cfg.ProxyPort)
+	} else {
+		iface, err = ce.resourceAllocator.AllocateInterface()
+		if err != nil {
+			return errors.Wrap(err, "could not allocate interface")
+		}
 	}
+
 	log.Debug().Msgf("Allocated interface: %s", iface)
 
 	cfg.IfaceName = iface
@@ -122,7 +131,7 @@ func (ce *connectionEndpoint) InterfaceName() string {
 }
 
 // PeerStats returns stats information about connected peer.
-func (ce *connectionEndpoint) PeerStats() (*wgcfg.Stats, error) {
+func (ce *connectionEndpoint) PeerStats() (wgcfg.Stats, error) {
 	return ce.wgClient.PeerStats(ce.cfg.IfaceName)
 }
 
@@ -151,6 +160,12 @@ func (ce *connectionEndpoint) Stop() error {
 }
 
 func (ce *connectionEndpoint) cleanAbandonedInterfaces() error {
+	if config.GetBool(config.FlagDVPNMode) {
+		// Do not clean up unknown interfaces in dVPN mode.
+		// There could be several connections at the same time and we should not kill them.
+		return nil
+	}
+
 	ifaces, err := ce.resourceAllocator.AbandonedInterfaces()
 	if err != nil {
 		return err

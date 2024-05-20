@@ -34,16 +34,21 @@ import (
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/datasize"
 	"github.com/mysteriumnetwork/node/identity/registry"
-	"github.com/mysteriumnetwork/node/metadata"
 	"github.com/mysteriumnetwork/node/money"
 	tequilapi_client "github.com/mysteriumnetwork/node/tequilapi/client"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
+	"github.com/mysteriumnetwork/terms/terms-go"
 )
 
 // CommandName is the name of this command
 const CommandName = "connection"
 
 var (
+	flagProxyPort = cli.IntFlag{
+		Name:  "proxy",
+		Usage: "Proxy port",
+	}
+
 	flagCountry = cli.StringFlag{
 		Name:  "country",
 		Usage: "Two letter (ISO 3166-1 alpha-2) country code to filter proposals.",
@@ -56,7 +61,7 @@ var (
 
 	flagSortType = cli.StringFlag{
 		Name:  "sort",
-		Usage: "Proposal sorting type. One of: quality, bandwidth, latency or price",
+		Usage: "Proposal sorting type. One of: quality, bandwidth, latency, uptime or price",
 		Value: "quality",
 	}
 
@@ -109,7 +114,7 @@ func NewCommand() *cli.Command {
 				Name:      "up",
 				ArgsUsage: "[ProviderIdentityAddress]",
 				Usage:     "Create a new connection",
-				Flags:     []cli.Flag{&config.FlagAgreedTermsConditions, &flagCountry, &flagLocationType, &flagSortType, &flagIncludeFailed},
+				Flags:     []cli.Flag{&config.FlagAgreedTermsConditions, &flagCountry, &flagLocationType, &flagSortType, &flagIncludeFailed, &flagProxyPort},
 				Action: func(ctx *cli.Context) error {
 					cmd.up(ctx)
 					return nil
@@ -118,16 +123,18 @@ func NewCommand() *cli.Command {
 			{
 				Name:  "down",
 				Usage: "Disconnect from your current connection",
+				Flags: []cli.Flag{&flagProxyPort},
 				Action: func(ctx *cli.Context) error {
-					cmd.down()
+					cmd.down(ctx)
 					return nil
 				},
 			},
 			{
 				Name:  "info",
 				Usage: "Show information about your connection",
+				Flags: []cli.Flag{&flagProxyPort},
 				Action: func(ctx *cli.Context) error {
-					cmd.info()
+					cmd.info(ctx)
 					return nil
 				},
 			},
@@ -167,15 +174,15 @@ func (c *command) proposals(ctx *cli.Context) {
 	w.Flush()
 }
 
-func (c *command) down() {
-	status, err := c.tequilapi.ConnectionStatus()
+func (c *command) down(ctx *cli.Context) {
+	status, err := c.tequilapi.ConnectionStatus(ctx.Int(flagProxyPort.Name))
 	if err != nil {
 		clio.Warn("Could not get connection status")
 		return
 	}
 
 	if status.Status != string(connectionstate.NotConnected) {
-		if err := c.tequilapi.ConnectionDestroy(); err != nil {
+		if err := c.tequilapi.ConnectionDestroy(ctx.Int(flagProxyPort.Name)); err != nil {
 			clio.Warn(err)
 			return
 		}
@@ -192,12 +199,12 @@ func (c *command) handleTOS(ctx *cli.Context) error {
 
 	agreed := c.cfg.GetBool(contract.TermsConsumerAgreed)
 	if !agreed {
-		return errors.New("You must agree with consumer terms of use in order to use this command")
+		return errors.New("you must agree with consumer terms of use in order to use this command")
 	}
 
 	version := c.cfg.GetString(contract.TermsVersion)
-	if version != metadata.CurrentTermsVersion {
-		return fmt.Errorf("You've agreed to terms of use version %s, but version %s is required", version, metadata.CurrentTermsVersion)
+	if version != terms.TermsVersion {
+		return fmt.Errorf("you've agreed to terms of use version %s, but version %s is required", version, terms.TermsVersion)
 	}
 
 	return nil
@@ -207,7 +214,7 @@ func (c *command) acceptTOS() {
 	t := true
 	if err := c.tequilapi.UpdateTerms(contract.TermsRequest{
 		AgreedConsumer: &t,
-		AgreedVersion:  metadata.CurrentTermsVersion,
+		AgreedVersion:  terms.TermsVersion,
 	}); err != nil {
 		clio.Info("Failed to save terms of use agreement, you will have to re-agree on next launch")
 	}
@@ -219,7 +226,7 @@ func (c *command) up(ctx *cli.Context) {
 		return
 	}
 
-	status, err := c.tequilapi.ConnectionStatus()
+	status, err := c.tequilapi.ConnectionStatus(ctx.Int(flagProxyPort.Name))
 	if err != nil {
 		clio.Warn("Could not get connection status")
 		return
@@ -227,7 +234,7 @@ func (c *command) up(ctx *cli.Context) {
 
 	switch connectionstate.State(status.Status) {
 	case
-		connectionstate.Connected,
+		// connectionstate.Connected,
 		connectionstate.Connecting,
 		connectionstate.Disconnecting,
 		connectionstate.Reconnecting:
@@ -268,6 +275,7 @@ func (c *command) up(ctx *cli.Context) {
 	connectOptions := contract.ConnectOptions{
 		DNS:               connection.DNSOptionAuto,
 		DisableKillSwitch: false,
+		ProxyPort:         ctx.Int(flagProxyPort.Name),
 	}
 	hermesID, err := c.cfg.GetHermesID()
 	if err != nil {
@@ -285,14 +293,14 @@ func (c *command) up(ctx *cli.Context) {
 
 	_, err = c.tequilapi.SmartConnectionCreate(id.Address, hermesID, serviceWireguard, filter, connectOptions)
 	if err != nil {
-		clio.Error("Failed to create a new connection", err)
+		clio.Error("Failed to create a new connection: ", err)
 		return
 	}
 
 	clio.Success("Connected")
 }
 
-func (c *command) info() {
+func (c *command) info(ctx *cli.Context) {
 	inf := newConnInfo()
 
 	id, err := c.tequilapi.CurrentIdentity("", "")
@@ -300,7 +308,7 @@ func (c *command) info() {
 		inf.set(infIdentity, id.Address)
 	}
 
-	status, err := c.tequilapi.ConnectionStatus()
+	status, err := c.tequilapi.ConnectionStatus(ctx.Int(flagProxyPort.Name))
 	if err == nil {
 		if status.Status == string(connectionstate.Connected) {
 			inf.isConnected = true
@@ -311,12 +319,12 @@ func (c *command) info() {
 		inf.set(infSessionID, status.SessionID)
 	}
 
-	ip, err := c.tequilapi.ConnectionIP()
+	ip, err := c.tequilapi.ProxyIP(ctx.Int(flagProxyPort.Name))
 	if err == nil {
 		inf.set(infIP, ip.IP)
 	}
 
-	location, err := c.tequilapi.ConnectionLocation()
+	location, err := c.tequilapi.ProxyLocation(ctx.Int(flagProxyPort.Name))
 	if err == nil {
 		inf.set(infLocation, fmt.Sprintf("%s, %s (%s - %s)", location.City, location.Country, location.IPType, location.ISP))
 	}
@@ -326,7 +334,7 @@ func (c *command) info() {
 		return
 	}
 
-	statistics, err := c.tequilapi.ConnectionStatistics()
+	statistics, err := c.tequilapi.ConnectionStatistics(status.SessionID)
 	if err == nil {
 		inf.set(infDuration, fmt.Sprint(time.Duration(statistics.Duration)*time.Second))
 		inf.set(infTransferred, fmt.Sprintf("%s/%s", datasize.FromBytes(statistics.BytesReceived), datasize.FromBytes(statistics.BytesSent)))

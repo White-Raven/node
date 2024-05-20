@@ -18,10 +18,11 @@
 package location
 
 import (
-	"github.com/mysteriumnetwork/node/core/location/locationstate"
-	"github.com/mysteriumnetwork/node/requests"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+
+	"github.com/mysteriumnetwork/node/core/location/locationstate"
+	"github.com/mysteriumnetwork/node/requests"
 )
 
 type oracleResolver struct {
@@ -32,6 +33,7 @@ type oracleResolver struct {
 type oracleLocation struct {
 	ASN       int    `json:"asn"`
 	City      string `json:"city"`
+	Region    string `json:"region"`
 	Continent string `json:"continent"`
 	Country   string `json:"country"`
 	IP        string `json:"ip"`
@@ -43,6 +45,7 @@ func (l oracleLocation) ToLocation() locationstate.Location {
 	return locationstate.Location{
 		ASN:       l.ASN,
 		City:      l.City,
+		Region:    l.Region,
 		Continent: l.Continent,
 		Country:   l.Country,
 		IP:        l.IP,
@@ -70,6 +73,21 @@ func (o *oracleResolver) DetectLocation() (location locationstate.Location, err 
 
 	var res oracleLocation
 	err = o.httpClient.DoRequestAndParseResponse(request, &res)
+
+	return res.ToLocation(), errors.Wrap(err, "failed to execute request")
+}
+
+// DetectProxyLocation detects current IP-address provides location information for the IP.
+func (o *oracleResolver) DetectProxyLocation(proxyPort int) (location locationstate.Location, err error) {
+	log.Debug().Msg("Detecting with oracle resolver")
+	request, err := requests.NewGetRequest(o.address, "", nil)
+	if err != nil {
+		log.Error().Err(err).Msg("")
+		return locationstate.Location{}, errors.Wrap(err, "failed to create request")
+	}
+
+	var res oracleLocation
+	err = o.httpClient.DoRequestViaProxyAndParseResponse(request, &res, proxyPort)
 
 	return res.ToLocation(), errors.Wrap(err, "failed to execute request")
 }

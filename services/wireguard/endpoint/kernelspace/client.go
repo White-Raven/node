@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
@@ -93,6 +94,12 @@ func (c *client) configureDevice(config wgcfg.DeviceConfig) error {
 		return err
 	}
 
+	if config.MTU > 0 {
+		if err := cmdutil.SudoExec("ip", "link", "set", "dev", config.IfaceName, "mtu", strconv.Itoa(config.MTU)); err != nil {
+			return err
+		}
+	}
+
 	peer, err := peerConfig(config.Peer)
 	if err != nil {
 		return err
@@ -158,17 +165,17 @@ func peerConfig(peer wgcfg.Peer) (wgtypes.PeerConfig, error) {
 	}, nil
 }
 
-func (c *client) PeerStats(string) (*wgcfg.Stats, error) {
+func (c *client) PeerStats(string) (wgcfg.Stats, error) {
 	d, err := c.wgClient.Device(c.iface)
 	if err != nil {
-		return nil, err
+		return wgcfg.Stats{}, err
 	}
 
 	if len(d.Peers) != 1 {
-		return nil, errors.New("kernelspace: exactly 1 peer expected")
+		return wgcfg.Stats{}, errors.New("kernelspace: exactly 1 peer expected")
 	}
 
-	return &wgcfg.Stats{
+	return wgcfg.Stats{
 		BytesReceived: uint64(d.Peers[0].ReceiveBytes),
 		BytesSent:     uint64(d.Peers[0].TransmitBytes),
 		LastHandshake: d.Peers[0].LastHandshakeTime,

@@ -20,29 +20,34 @@ package cmd
 import (
 	"time"
 
+	"github.com/mysteriumnetwork/node/core/policy/requested"
+
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 
 	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/core/connection"
 	"github.com/mysteriumnetwork/node/core/node"
-	"github.com/mysteriumnetwork/node/core/policy"
+	"github.com/mysteriumnetwork/node/core/policy/localcopy"
 	"github.com/mysteriumnetwork/node/core/service"
 	"github.com/mysteriumnetwork/node/core/service/servicestate"
-	"github.com/mysteriumnetwork/node/identity/registry"
+	"github.com/mysteriumnetwork/node/dns"
 	"github.com/mysteriumnetwork/node/mmn"
 	"github.com/mysteriumnetwork/node/nat"
 	"github.com/mysteriumnetwork/node/p2p"
+	"github.com/mysteriumnetwork/node/services/datatransfer"
+	"github.com/mysteriumnetwork/node/services/dvpn"
 	service_noop "github.com/mysteriumnetwork/node/services/noop"
 	service_openvpn "github.com/mysteriumnetwork/node/services/openvpn"
 	openvpn_service "github.com/mysteriumnetwork/node/services/openvpn/service"
+	"github.com/mysteriumnetwork/node/services/scraping"
 	"github.com/mysteriumnetwork/node/services/wireguard"
 	wireguard_connection "github.com/mysteriumnetwork/node/services/wireguard/connection"
 	"github.com/mysteriumnetwork/node/services/wireguard/endpoint"
+	netstack_provider "github.com/mysteriumnetwork/node/services/wireguard/endpoint/netstack-provider"
 	"github.com/mysteriumnetwork/node/services/wireguard/resources"
 	wireguard_service "github.com/mysteriumnetwork/node/services/wireguard/service"
 	"github.com/mysteriumnetwork/node/session/pingpong"
-	pingpong_noop "github.com/mysteriumnetwork/node/session/pingpong/noop"
 )
 
 // bootstrapServices loads all the components required for running services
@@ -57,14 +62,33 @@ func (di *Dependencies) bootstrapServices(nodeOptions node.Options) error {
 		return errors.Wrap(err, "service bootstrap failed")
 	}
 
+	if config.GetBool(config.FlagUserspace) {
+		netstack_provider.InitUserspaceShaper(di.EventBus)
+	}
 	di.bootstrapServiceOpenvpn(nodeOptions)
 	di.bootstrapServiceNoop(nodeOptions)
-	di.bootstrapServiceWireguard(nodeOptions)
+	resourcesAllocator := resources.NewAllocator(di.PortPool, wireguard_service.GetOptions().Subnet)
+
+	dnsHandler, err := dns.ResolveViaSystem()
+	if err != nil {
+		log.Error().Err(err).Msg("Provider DNS are not available")
+		return err
+	}
+
+	di.dnsProxy = dns.NewProxy("", config.GetInt(config.FlagDNSListenPort), dnsHandler)
+
+	// disable for mobile
+	if !nodeOptions.Mobile {
+		di.bootstrapServiceWireguard(nodeOptions, resourcesAllocator, di.WireguardClientFactory)
+	}
+	di.bootstrapServiceScraping(nodeOptions, resourcesAllocator, di.WireguardClientFactory)
+	di.bootstrapServiceDataTransfer(nodeOptions, resourcesAllocator, di.WireguardClientFactory)
+	di.bootstrapServiceDVPN(nodeOptions, resourcesAllocator, di.WireguardClientFactory)
 
 	return nil
 }
 
-func (di *Dependencies) bootstrapServiceWireguard(nodeOptions node.Options) {
+func (di *Dependencies) bootstrapServiceWireguard(nodeOptions node.Options, resourcesAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
 	di.ServiceRegistry.Register(
 		wireguard.ServiceType,
 		func(serviceOptions service.Options) (service.Service, error) {
@@ -73,16 +97,87 @@ func (di *Dependencies) bootstrapServiceWireguard(nodeOptions node.Options) {
 				return nil, err
 			}
 
-			wgOptions := serviceOptions.(wireguard_service.Options)
+			svc := wireguard_service.NewManager(
+				di.IPResolver,
+				loc.Country,
+				di.NATService,
+				di.EventBus,
+				di.ServiceFirewall,
+				resourcesAllocator,
+				wgClientFactory,
+				di.dnsProxy,
+			)
+			return svc, nil
+		},
+	)
+}
+
+func (di *Dependencies) bootstrapServiceScraping(nodeOptions node.Options, resourcesAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
+	di.ServiceRegistry.Register(
+		scraping.ServiceType,
+		func(serviceOptions service.Options) (service.Service, error) {
+			loc, err := di.LocationResolver.DetectLocation()
+			if err != nil {
+				return nil, err
+			}
 
 			svc := wireguard_service.NewManager(
 				di.IPResolver,
 				loc.Country,
 				di.NATService,
 				di.EventBus,
-				wgOptions,
-				di.PortPool,
 				di.ServiceFirewall,
+				resourcesAllocator,
+				wgClientFactory,
+				di.dnsProxy,
+			)
+			return svc, nil
+		},
+	)
+}
+
+func (di *Dependencies) bootstrapServiceDataTransfer(nodeOptions node.Options, resourcesAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
+	di.ServiceRegistry.Register(
+		datatransfer.ServiceType,
+		func(serviceOptions service.Options) (service.Service, error) {
+			loc, err := di.LocationResolver.DetectLocation()
+			if err != nil {
+				return nil, err
+			}
+
+			svc := wireguard_service.NewManager(
+				di.IPResolver,
+				loc.Country,
+				di.NATService,
+				di.EventBus,
+				di.ServiceFirewall,
+				resourcesAllocator,
+				wgClientFactory,
+				di.dnsProxy,
+			)
+			return svc, nil
+		},
+	)
+}
+
+func (di *Dependencies) bootstrapServiceDVPN(nodeOptions node.Options, resourcesAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
+	di.ServiceRegistry.Register(
+		dvpn.ServiceType,
+		func(serviceOptions service.Options) (service.Service, error) {
+			loc, err := di.LocationResolver.DetectLocation()
+			if err != nil {
+				return nil, err
+			}
+
+			svc := wireguard_service.NewManager(
+				di.IPResolver,
+				loc.Country,
+				di.NATService,
+				di.EventBus,
+				di.ServiceFirewall,
+				resourcesAllocator,
+				wgClientFactory,
+				di.dnsProxy,
 			)
 			return svc, nil
 		},
@@ -127,40 +222,21 @@ func (di *Dependencies) bootstrapServiceNoop(nodeOptions node.Options) {
 	)
 }
 
-func (di *Dependencies) bootstrapProviderRegistrar(nodeOptions node.Options) error {
-	if nodeOptions.Consumer {
-		log.Debug().Msg("Skipping provider registrar for consumer mode")
-		return nil
-	}
-
-	cfg := registry.ProviderRegistrarConfig{
-		DelayBetweenRetries: nodeOptions.Transactor.ProviderRegistrationRetryDelay,
-	}
-
-	fact := func(hermesURL string) registry.ProviderPromiseQuerier {
-		return pingpong.NewHermesCaller(di.HTTPClient, hermesURL)
-	}
-	di.ProviderRegistrar = registry.NewProviderRegistrar(di.Transactor, di.IdentityRegistry, di.AddressProvider, di.BCHelper, cfg, fact)
-	return di.ProviderRegistrar.Subscribe(di.EventBus)
-}
-
 func (di *Dependencies) bootstrapHermesPromiseSettler(nodeOptions node.Options) error {
 	di.HermesChannelRepository = pingpong.NewHermesChannelRepository(
 		di.HermesPromiseStorage,
 		di.BCHelper,
 		di.EventBus,
 		di.BeneficiaryProvider,
+		di.HermesCaller,
+		di.AddressProvider,
+		di.SignerFactory,
+		di.Keystore,
 	)
 
 	if err := di.HermesChannelRepository.Subscribe(di.EventBus); err != nil {
 		log.Error().Err(err).Msg("Failed to subscribe channel repository")
 		return errors.Wrap(err, "could not subscribe channel repository to relevant events")
-	}
-
-	if nodeOptions.Consumer {
-		log.Debug().Msg("Skipping hermes promise settler for consumer mode")
-		di.HermesPromiseSettler = &pingpong_noop.NoopHermesPromiseSettler{}
-		return nil
 	}
 
 	settler := pingpong.NewHermesPromiseSettler(
@@ -178,13 +254,17 @@ func (di *Dependencies) bootstrapHermesPromiseSettler(nodeOptions node.Options) 
 		di.Keystore,
 		di.SettlementHistoryStorage,
 		di.EventBus,
+		di.ObserverAPI,
+		di.BeneficiaryAddressStorage,
 		pingpong.HermesPromiseSettlerConfig{
-			Threshold:                    nodeOptions.Payments.HermesPromiseSettlingThreshold,
-			SettlementCheckTimeout:       nodeOptions.Payments.SettlementTimeout,
-			SettlementCheckInterval:      nodeOptions.Payments.SettlementRecheckInterval,
-			L1ChainID:                    nodeOptions.Chains.Chain1.ChainID,
-			L2ChainID:                    nodeOptions.Chains.Chain2.ChainID,
-			ZeroStakeSettlementThreshold: nodeOptions.Payments.ZeroStakeSettlementThreshold,
+			BalanceThreshold:        nodeOptions.Payments.HermesPromiseSettlingThreshold,
+			MaxFeeThreshold:         nodeOptions.Payments.MaxFeeSettlingThreshold,
+			MinAutoSettleAmount:     nodeOptions.Payments.MinAutoSettleAmount,
+			MaxUnSettledAmount:      nodeOptions.Payments.MaxUnSettledAmount,
+			SettlementCheckTimeout:  nodeOptions.Payments.SettlementTimeout,
+			SettlementCheckInterval: nodeOptions.Payments.SettlementRecheckInterval,
+			L1ChainID:               nodeOptions.Chains.Chain1.ChainID,
+			L2ChainID:               nodeOptions.Chains.Chain2.ChainID,
 		},
 	)
 	if err := settler.Subscribe(di.EventBus); err != nil {
@@ -205,26 +285,34 @@ func (di *Dependencies) bootstrapServiceComponents(nodeOptions node.Options) err
 
 	di.ServiceSessions = service.NewSessionPool(di.EventBus)
 
-	di.PolicyOracle = policy.NewOracle(
+	di.PolicyOracle = localcopy.NewOracle(
 		di.HTTPClient,
 		config.GetString(config.FlagAccessPolicyAddress),
 		config.GetDuration(config.FlagAccessPolicyFetchInterval),
+		config.GetBool(config.FlagAccessPolicyFetchingEnabled),
 	)
 	go di.PolicyOracle.Start()
 
-	di.HermesStatusChecker = pingpong.NewHermesStatusChecker(di.BCHelper, nodeOptions.Payments.HermesStatusRecheckInterval)
+	di.PolicyProvider = requested.NewRequestedProvider(
+		di.HTTPClient,
+		config.GetString(config.FlagAccessPolicyAddress),
+	)
+
+	di.HermesStatusChecker = pingpong.NewHermesStatusChecker(di.BCHelper, di.ObserverAPI, nodeOptions.Payments.HermesStatusRecheckInterval)
 
 	newP2PSessionHandler := func(serviceInstance *service.Instance, channel p2p.Channel) *service.SessionManager {
 		paymentEngineFactory := pingpong.InvoiceFactoryCreator(
-			channel, nodeOptions.Payments.ProviderInvoiceFrequency,
+			channel, nodeOptions.Payments.ProviderInvoiceFrequency, nodeOptions.Payments.ProviderLimitInvoiceFrequency,
 			pingpong.PromiseWaitTimeout, di.ProviderInvoiceStorage,
 			pingpong.DefaultHermesFailureCount,
 			uint16(nodeOptions.Payments.MaxAllowedPaymentPercentile),
 			nodeOptions.Payments.MaxUnpaidInvoiceValue,
+			nodeOptions.Payments.LimitUnpaidInvoiceValue,
 			di.HermesStatusChecker,
 			di.EventBus,
 			di.HermesPromiseHandler,
 			di.AddressProvider,
+			di.ObserverAPI,
 		)
 		return service.NewSessionManager(
 			serviceInstance,
@@ -242,6 +330,7 @@ func (di *Dependencies) bootstrapServiceComponents(nodeOptions node.Options) err
 		di.DiscoveryFactory,
 		di.EventBus,
 		di.PolicyOracle,
+		di.PolicyProvider,
 		di.P2PListener,
 		newP2PSessionHandler,
 		di.SessionConnectivityStatusStorage,
@@ -259,15 +348,20 @@ func (di *Dependencies) bootstrapServiceComponents(nodeOptions node.Options) err
 func (di *Dependencies) registerConnections(nodeOptions node.Options) {
 	di.registerOpenvpnConnection(nodeOptions)
 	di.registerNoopConnection()
-	di.registerWireguardConnection(nodeOptions)
+
+	resourceAllocator := resources.NewAllocator(nil, wireguard_service.DefaultOptions.Subnet)
+
+	di.registerWireguardConnection(nodeOptions, resourceAllocator, di.WireguardClientFactory)
+	di.registerScrapingConnection(nodeOptions, resourceAllocator, di.WireguardClientFactory)
+	di.registerDataTransferConnection(nodeOptions, resourceAllocator, di.WireguardClientFactory)
+	di.registerDVPNConnection(nodeOptions, resourceAllocator, di.WireguardClientFactory)
 }
 
-func (di *Dependencies) registerWireguardConnection(nodeOptions node.Options) {
+func (di *Dependencies) registerWireguardConnection(nodeOptions node.Options, resourceAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
 	wireguard.Bootstrap()
 	handshakeWaiter := wireguard_connection.NewHandshakeWaiter()
 	endpointFactory := func() (wireguard.ConnectionEndpoint, error) {
-		resourceAllocator := resources.NewAllocator(nil, wireguard_service.DefaultOptions.Subnet)
-		return endpoint.NewConnectionEndpoint(resourceAllocator)
+		return endpoint.NewConnectionEndpoint(resourceAllocator, wgClientFactory)
 	}
 	connFactory := func() (connection.Connection, error) {
 		opts := wireguard_connection.Options{
@@ -277,6 +371,54 @@ func (di *Dependencies) registerWireguardConnection(nodeOptions node.Options) {
 		return wireguard_connection.NewConnection(opts, di.IPResolver, endpointFactory, handshakeWaiter)
 	}
 	di.ConnectionRegistry.Register(wireguard.ServiceType, connFactory)
+}
+
+func (di *Dependencies) registerScrapingConnection(nodeOptions node.Options, resourceAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
+	scraping.Bootstrap()
+	handshakeWaiter := wireguard_connection.NewHandshakeWaiter()
+	endpointFactory := func() (wireguard.ConnectionEndpoint, error) {
+		return endpoint.NewConnectionEndpoint(resourceAllocator, wgClientFactory)
+	}
+	connFactory := func() (connection.Connection, error) {
+		opts := wireguard_connection.Options{
+			DNSScriptDir:     nodeOptions.Directories.Script,
+			HandshakeTimeout: 1 * time.Minute,
+		}
+		return wireguard_connection.NewConnection(opts, di.IPResolver, endpointFactory, handshakeWaiter)
+	}
+	di.ConnectionRegistry.Register(scraping.ServiceType, connFactory)
+}
+
+func (di *Dependencies) registerDataTransferConnection(nodeOptions node.Options, resourceAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
+	datatransfer.Bootstrap()
+	handshakeWaiter := wireguard_connection.NewHandshakeWaiter()
+	endpointFactory := func() (wireguard.ConnectionEndpoint, error) {
+		return endpoint.NewConnectionEndpoint(resourceAllocator, wgClientFactory)
+	}
+	connFactory := func() (connection.Connection, error) {
+		opts := wireguard_connection.Options{
+			DNSScriptDir:     nodeOptions.Directories.Script,
+			HandshakeTimeout: 1 * time.Minute,
+		}
+		return wireguard_connection.NewConnection(opts, di.IPResolver, endpointFactory, handshakeWaiter)
+	}
+	di.ConnectionRegistry.Register(datatransfer.ServiceType, connFactory)
+}
+
+func (di *Dependencies) registerDVPNConnection(nodeOptions node.Options, resourceAllocator *resources.Allocator, wgClientFactory *endpoint.WgClientFactory) {
+	dvpn.Bootstrap()
+	handshakeWaiter := wireguard_connection.NewHandshakeWaiter()
+	endpointFactory := func() (wireguard.ConnectionEndpoint, error) {
+		return endpoint.NewConnectionEndpoint(resourceAllocator, wgClientFactory)
+	}
+	connFactory := func() (connection.Connection, error) {
+		opts := wireguard_connection.Options{
+			DNSScriptDir:     nodeOptions.Directories.Script,
+			HandshakeTimeout: 1 * time.Minute,
+		}
+		return wireguard_connection.NewConnection(opts, di.IPResolver, endpointFactory, handshakeWaiter)
+	}
+	di.ConnectionRegistry.Register(dvpn.ServiceType, connFactory)
 }
 
 func (di *Dependencies) bootstrapMMN() error {

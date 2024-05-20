@@ -158,13 +158,12 @@ func (c *Connection) start(ctx context.Context, start startConn, options connect
 			KeepAlivePeriodSeconds: 18,
 		},
 		ReplacePeers: true,
+		ProxyPort:    options.Params.ProxyPort,
 	})
 	if err != nil {
 		return errors.Wrap(err, "could not start new connection")
 	}
 	c.connectionEndpoint = conn
-
-	log.Info().Msgf("Adding connection peer %s", config.Provider.Endpoint.String())
 
 	log.Info().Msg("Waiting for initial handshake")
 	if err = c.handshakeWaiter.Wait(ctx, conn.PeerStats, c.opts.HandshakeTimeout, c.done); err != nil {
@@ -190,10 +189,18 @@ func (c *Connection) startConn(conf wgcfg.DeviceConfig) (wg.ConnectionEndpoint, 
 }
 
 func (c *Connection) restartConn(conf wgcfg.DeviceConfig) (wg.ConnectionEndpoint, error) {
+	var err error
 	conn := c.connectionEndpoint
-
 	log.Info().Msg("Restarting connection endpoint")
-	if err := conn.ReconfigureConsumerMode(conf); err != nil {
+
+	if conn == nil {
+		conn, err = c.connEndpointFactory()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create new connection endpoint on restart")
+		}
+	}
+
+	if err = conn.ReconfigureConsumerMode(conf); err != nil {
 		return nil, fmt.Errorf("failed to restart connection endpoint: %w", err)
 	}
 

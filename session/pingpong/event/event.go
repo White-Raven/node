@@ -21,6 +21,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/payments/crypto"
 )
@@ -66,8 +67,14 @@ type AppEventBalanceChanged struct {
 // AppEventEarningsChanged represents a balance change event
 type AppEventEarningsChanged struct {
 	Identity identity.Identity
-	Previous Earnings
-	Current  Earnings
+	Previous EarningsDetailed
+	Current  EarningsDetailed
+}
+
+// EarningsDetailed returns total and split per hermes earnings
+type EarningsDetailed struct {
+	Total     Earnings
+	PerHermes map[common.Address]Earnings
 }
 
 // Earnings represents current identity earnings
@@ -78,6 +85,7 @@ type Earnings struct {
 
 // AppEventInvoicePaid is an update on paid invoices during current session
 type AppEventInvoicePaid struct {
+	UUID       string
 	ConsumerID identity.Identity
 	SessionID  string
 	Invoice    crypto.Invoice
@@ -96,11 +104,9 @@ type AppEventGrandTotalChanged struct {
 
 // AppEventSettlementComplete represent a completed settlement.
 type AppEventSettlementComplete struct {
-	ProviderID       identity.Identity
-	TxHash           string
-	HermesID         common.Address
-	BlockExplorerURL string
-	ChainID          int64
+	ProviderID identity.Identity
+	HermesID   common.Address
+	ChainID    int64
 }
 
 // AppEventWithdrawalRequested represents a request for withdrawal.

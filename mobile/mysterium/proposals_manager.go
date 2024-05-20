@@ -28,7 +28,10 @@ import (
 	"github.com/mysteriumnetwork/node/market"
 	"github.com/mysteriumnetwork/node/money"
 	"github.com/mysteriumnetwork/node/nat"
+	"github.com/mysteriumnetwork/node/services/datatransfer"
+	"github.com/mysteriumnetwork/node/services/dvpn"
 	"github.com/mysteriumnetwork/node/services/openvpn"
+	"github.com/mysteriumnetwork/node/services/scraping"
 	"github.com/mysteriumnetwork/node/services/wireguard"
 )
 
@@ -66,6 +69,7 @@ type GetProposalsRequest struct {
 
 func (r GetProposalsRequest) toFilter() *proposal.Filter {
 	return &proposal.Filter{
+		PresetID:           r.PresetID,
 		ServiceType:        r.ServiceType,
 		LocationCountry:    r.LocationCountry,
 		IPType:             r.IPType,
@@ -199,6 +203,7 @@ func (m *proposalsManager) getFromRepository(req *GetProposalsRequest) ([]propos
 			filter.NATCompatibility = natType
 		}
 	}
+	filter.CompatibilityMin = 2
 	allProposals, err := m.repository.Proposals(filter)
 	if err != nil {
 		return nil, fmt.Errorf("could not get proposals from repository: %w", err)
@@ -206,9 +211,16 @@ func (m *proposalsManager) getFromRepository(req *GetProposalsRequest) ([]propos
 
 	// Ideally api should allow to pass multiple service types to skip noop
 	// proposals, but for now just filter in memory.
+	serviceTypes := map[string]bool{
+		openvpn.ServiceType:      true,
+		wireguard.ServiceType:    true,
+		datatransfer.ServiceType: true,
+		scraping.ServiceType:     true,
+		dvpn.ServiceType:         true,
+	}
 	var res []proposal.PricedServiceProposal
 	for _, p := range allProposals {
-		if p.ServiceType == openvpn.ServiceType || p.ServiceType == wireguard.ServiceType {
+		if serviceTypes[p.ServiceType] {
 			res = append(res, p)
 		}
 	}
@@ -225,6 +237,7 @@ func (m *proposalsManager) getCountriesFromRepository(req *GetProposalsRequest) 
 			filter.NATCompatibility = natType
 		}
 	}
+	filter.CompatibilityMin = 2
 	countries, err := m.repository.Countries(filter)
 	if err != nil {
 		return nil, fmt.Errorf("could not get proposals from repository: %w", err)

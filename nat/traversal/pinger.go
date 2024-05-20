@@ -40,7 +40,7 @@ import (
 const StageName = "hole_punching"
 
 const (
-	bufferLen = 2048 * 1024
+	bufferLen = 64
 
 	maxTTL            = 128
 	msgOK             = "OK"
@@ -244,7 +244,6 @@ func (p *Pinger) PingProviderPeer(ctx context.Context, localIP, remoteIP string,
 
 	cleanupConnections(pings)
 	return nil, ErrTooFew
-
 }
 
 // sendConnACK notifies peer that we are using this connection
@@ -330,8 +329,6 @@ func (p *Pinger) ping(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UD
 		case <-ctx.Done():
 			return nil
 		case <-time.After(p.pingConfig.Interval):
-			log.Trace().Msgf("Pinging %s from %s... with ttl %d", remoteAddr, conn.LocalAddr(), ttl)
-
 			_, err := conn.WriteToUDP([]byte(msgPing+remoteAddr.String()), remoteAddr)
 			if ctx.Err() != nil {
 				return nil
@@ -394,7 +391,7 @@ func (p *Pinger) pingReceiver(ctx context.Context, conn *net.UDPConn) (*net.UDPA
 		}
 
 		msg := string(buf[:n])
-		log.Debug().Msgf("Remote peer data received: %s, len: %d, from: %s", msg, n, raddr)
+		log.Debug().Msgf("Remote peer data received, len: %d", n)
 
 		if msg == msgOK || strings.HasPrefix(msg, msgPing) {
 			return raddr, nil
@@ -460,7 +457,7 @@ func (p *Pinger) singlePing(ctx context.Context, localIP, remoteIP string, local
 		return nil, fmt.Errorf("failed to protect udp connection: %w", err)
 	}
 
-	log.Info().Msgf("Local socket: %s", conn.LocalAddr())
+	log.Debug().Msgf("Local socket: %s", conn.LocalAddr())
 
 	remoteAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", remoteIP, remotePort))
 	if err != nil {

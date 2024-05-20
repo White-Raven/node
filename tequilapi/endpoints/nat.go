@@ -19,11 +19,11 @@ package endpoints
 
 import (
 	"context"
-	"net/http"
 
-	"github.com/mysteriumnetwork/node/core/node"
+	"github.com/mysteriumnetwork/node/core/monitoring"
 
 	"github.com/gin-gonic/gin"
+	"github.com/mysteriumnetwork/go-rest/apierror"
 
 	"github.com/mysteriumnetwork/node/nat"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
@@ -41,7 +41,7 @@ type natProber interface {
 }
 
 type nodeStatusProvider interface {
-	Status() node.MonitoringStatus
+	Status() monitoring.Status
 }
 
 // NewNATEndpoint creates and returns nat endpoint
@@ -54,31 +54,29 @@ func NewNATEndpoint(stateProvider stateProvider, natProber natProber) *NATEndpoi
 
 // NATType provides NAT type in terms of traversal capabilities
 // swagger:operation GET /nat/type NAT NATTypeDTO
-// ---
-// summary: Shows NAT type in terms of traversal capabilities.
-// description: Returns NAT type. May produce invalid result while VPN connection is established
-// responses:
-//   200:
-//     description: NAT type
-//     schema:
-//       "$ref": "#/definitions/NATTypeDTO"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Shows NAT type in terms of traversal capabilities.
+//	description: Returns NAT type. May produce invalid result while VPN connection is established
+//	responses:
+//	  200:
+//	    description: NAT type
+//	    schema:
+//	      "$ref": "#/definitions/NATTypeDTO"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (ne *NATEndpoint) NATType(c *gin.Context) {
-	req := c.Request
-	resp := c.Writer
-
-	res, err := ne.natProber.Probe(req.Context())
+	res, err := ne.natProber.Probe(c.Request.Context())
 	if err != nil {
-		utils.SendError(resp, err, http.StatusInternalServerError)
+		c.Error(apierror.Internal("NAT probe failed", contract.ErrCodeNATProbe))
 		return
 	}
 	utils.WriteAsJSON(contract.NATTypeDTO{
 		Type:  res,
 		Error: "",
-	}, resp)
+	}, c.Writer)
 }
 
 // AddRoutesForNAT adds nat routes to given router

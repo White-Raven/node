@@ -79,11 +79,23 @@ var (
 		Usage:  "The duration we'll wait before giving up trying to fetch new balance.",
 		Hidden: true,
 	}
-	// FlagPaymentsZeroStakeUnsettledAmount determines the minimum amount of myst required before auto settling is triggered if zero stake is used.
+	// FlagPaymentsZeroStakeUnsettledAmount determines the minimum amount of myst that we will settle automatically if zero stake is used.
 	FlagPaymentsZeroStakeUnsettledAmount = cli.Float64Flag{
 		Name:  "payments.zero-stake-unsettled-amount",
 		Value: 5.0,
 		Usage: "The settling threshold if provider uses a zero stake",
+	}
+	// FlagPaymentsPromiseSettleMaxFeeThreshold represents the max percentage of the settlement that will be acceptable to pay in transaction fees.
+	FlagPaymentsPromiseSettleMaxFeeThreshold = cli.Float64Flag{
+		Name:  "payments.settle.max-fee-percentage",
+		Value: 0.05,
+		Usage: "The max percentage we allow to pay in fees when automatically settling promises.",
+	}
+	// FlagPaymentsUnsettledMaxAmount determines the maximum amount of myst for which we will consider the fee threshold.
+	FlagPaymentsUnsettledMaxAmount = cli.Float64Flag{
+		Name:  "payments.unsettled.max-amount",
+		Value: 20.0,
+		Usage: "The maximum amount of unsettled myst, after that we will always try to settle.",
 	}
 	// FlagPaymentsRegistryTransactorPollInterval The duration we'll wait before calling transactor to check for new status updates.
 	FlagPaymentsRegistryTransactorPollInterval = cli.DurationFlag{
@@ -99,23 +111,11 @@ var (
 		Usage:  "The duration we'll wait before giving up on transactors registration status",
 		Hidden: true,
 	}
-	// FlagPaymentsProviderInvoiceFrequency determines how often the provider sends invoices.
-	FlagPaymentsProviderInvoiceFrequency = cli.DurationFlag{
-		Name:  "payments.provider.invoice-frequency",
-		Value: time.Minute,
-		Usage: "Determines how often the provider sends invoices.",
-	}
 	// FlagPaymentsConsumerDataLeewayMegabytes sets the data amount the consumer agrees to pay before establishing a session
 	FlagPaymentsConsumerDataLeewayMegabytes = cli.Uint64Flag{
-		Name:  "payments.consumer.data-leeway-megabytes",
+		Name:  metadata.FlagNames.PaymentsDataLeewayMegabytes,
 		Usage: "sets the data amount the consumer agrees to pay before establishing a session",
-		Value: metadata.MainnetDefinition.Payments.Consumer.DataLeewayMegabytes,
-	}
-	// FlagPaymentsMaxUnpaidInvoiceValue sets the upper limit of session payment value before forcing an invoice
-	FlagPaymentsMaxUnpaidInvoiceValue = cli.StringFlag{
-		Name:  "payments.provider.max-unpaid-invoice-value",
-		Usage: "sets the upper limit of session payment value before forcing an invoice. If this value is exceeded before a payment interval is reached, an invoice is sent.",
-		Value: "3000000000000000",
+		Value: metadata.MainnetDefinition.Payments.DataLeewayMegabytes,
 	}
 	// FlagPaymentsHermesStatusRecheckInterval sets how often we re-check the hermes status on bc. Higher values allow for less bc lookups but increase the risk for provider.
 	FlagPaymentsHermesStatusRecheckInterval = cli.DurationFlag{
@@ -131,14 +131,6 @@ var (
 		Usage:  "after syncing offchain balance, how long should node wait for next check to occur",
 		Value:  time.Minute * 30,
 	}
-	// FlagTestnet3HermesURL sets the default value for legacy (testnet3) hermes URL.
-	// TODO: Remove after migrations are considered done.
-	FlagTestnet3HermesURL = cli.StringFlag{
-		Name:   "payments.testnet3-hermes-url",
-		Usage:  "sets the URL for legacy testnet3 hermes",
-		Value:  metadata.Testnet3Definition.Testnet3HermesURL,
-		Hidden: true,
-	}
 	// FlagPaymentsDuringSessionDebug sets if we're in debug more for the payments done in a VPN session.
 	FlagPaymentsDuringSessionDebug = cli.BoolFlag{
 		Name:   "payments.during-session-debug",
@@ -153,6 +145,43 @@ var (
 		Value:  5000000000000000000,
 		Hidden: true,
 	}
+
+	// FlagObserverAddress address of Observer service.
+	FlagObserverAddress = cli.StringFlag{
+		Name:  metadata.FlagNames.ObserverAddress,
+		Usage: "full address of the observer service",
+		Value: metadata.DefaultNetwork.ObserverAddress,
+	}
+
+	// FlagPaymentsLimitUnpaidInvoiceValue sets the upper limit of session payment value before forcing an invoice
+	FlagPaymentsLimitUnpaidInvoiceValue = cli.StringFlag{
+		Name:  "payments.provider.max-unpaid-invoice-value-limit",
+		Usage: "sets the max upper limit of session payment value before forcing an invoice. If this value is exceeded before a payment interval is reached, an invoice is sent.",
+		Value: "30000000000000000",
+	}
+
+	// FlagPaymentsUnpaidInvoiceValue sets the starting max limit of session payment value before forcing an invoice
+	FlagPaymentsUnpaidInvoiceValue = cli.StringFlag{
+		Name:   "payments.provider.max-unpaid-invoice-value",
+		Usage:  "sets the starting upper limit of session payment value before forcing an invoice. If this value is exceeded before a payment interval is reached, an invoice is sent.",
+		Value:  "3000000000000000",
+		Hidden: true,
+	}
+
+	// FlagPaymentsProviderInvoiceFrequency determines how often the provider sends invoices.
+	FlagPaymentsProviderInvoiceFrequency = cli.DurationFlag{
+		Name:   "payments.provider.invoice-frequency",
+		Value:  time.Second * 5,
+		Usage:  "Determines how often the provider sends invoices.",
+		Hidden: true,
+	}
+
+	// FlagPaymentsLimitProviderInvoiceFrequency determines how often the provider sends invoices.
+	FlagPaymentsLimitProviderInvoiceFrequency = cli.DurationFlag{
+		Name:  "payments.provider.invoice-frequency-limit",
+		Value: time.Minute * 5,
+		Usage: "Determines how often the provider sends invoices.",
+	}
 )
 
 // RegisterFlagsPayments function register payments flags to flag list.
@@ -162,6 +191,8 @@ func RegisterFlagsPayments(flags *[]cli.Flag) {
 		&FlagPaymentsMaxHermesFee,
 		&FlagPaymentsBCTimeout,
 		&FlagPaymentsHermesPromiseSettleThreshold,
+		&FlagPaymentsPromiseSettleMaxFeeThreshold,
+		&FlagPaymentsUnsettledMaxAmount,
 		&FlagPaymentsHermesPromiseSettleTimeout,
 		&FlagPaymentsHermesPromiseSettleCheckInterval,
 		&FlagPaymentsLongBalancePollInterval,
@@ -169,15 +200,19 @@ func RegisterFlagsPayments(flags *[]cli.Flag) {
 		&FlagPaymentsFastBalancePollTimeout,
 		&FlagPaymentsRegistryTransactorPollTimeout,
 		&FlagPaymentsRegistryTransactorPollInterval,
-		&FlagPaymentsProviderInvoiceFrequency,
 		&FlagPaymentsConsumerDataLeewayMegabytes,
-		&FlagPaymentsMaxUnpaidInvoiceValue,
 		&FlagPaymentsHermesStatusRecheckInterval,
 		&FlagOffchainBalanceExpiration,
-		&FlagTestnet3HermesURL,
 		&FlagPaymentsZeroStakeUnsettledAmount,
 		&FlagPaymentsDuringSessionDebug,
 		&FlagPaymentsAmountDuringSessionDebug,
+		&FlagObserverAddress,
+
+		&FlagPaymentsProviderInvoiceFrequency,
+		&FlagPaymentsLimitProviderInvoiceFrequency,
+
+		&FlagPaymentsUnpaidInvoiceValue,
+		&FlagPaymentsLimitUnpaidInvoiceValue,
 	)
 }
 
@@ -186,9 +221,10 @@ func ParseFlagsPayments(ctx *cli.Context) {
 	Current.ParseIntFlag(ctx, FlagPaymentsMaxHermesFee)
 	Current.ParseDurationFlag(ctx, FlagPaymentsBCTimeout)
 	Current.ParseFloat64Flag(ctx, FlagPaymentsHermesPromiseSettleThreshold)
+	Current.ParseFloat64Flag(ctx, FlagPaymentsPromiseSettleMaxFeeThreshold)
+	Current.ParseFloat64Flag(ctx, FlagPaymentsUnsettledMaxAmount)
 	Current.ParseDurationFlag(ctx, FlagPaymentsHermesPromiseSettleTimeout)
 	Current.ParseDurationFlag(ctx, FlagPaymentsHermesPromiseSettleCheckInterval)
-	Current.ParseDurationFlag(ctx, FlagPaymentsProviderInvoiceFrequency)
 	Current.ParseDurationFlag(ctx, FlagPaymentsFastBalancePollInterval)
 	Current.ParseDurationFlag(ctx, FlagPaymentsFastBalancePollTimeout)
 	Current.ParseDurationFlag(ctx, FlagPaymentsLongBalancePollInterval)
@@ -196,11 +232,16 @@ func ParseFlagsPayments(ctx *cli.Context) {
 	Current.ParseDurationFlag(ctx, FlagPaymentsRegistryTransactorPollInterval)
 	Current.ParseDurationFlag(ctx, FlagPaymentsRegistryTransactorPollTimeout)
 	Current.ParseUInt64Flag(ctx, FlagPaymentsConsumerDataLeewayMegabytes)
-	Current.ParseStringFlag(ctx, FlagPaymentsMaxUnpaidInvoiceValue)
 	Current.ParseDurationFlag(ctx, FlagPaymentsHermesStatusRecheckInterval)
 	Current.ParseDurationFlag(ctx, FlagOffchainBalanceExpiration)
-	Current.ParseStringFlag(ctx, FlagTestnet3HermesURL)
 	Current.ParseFloat64Flag(ctx, FlagPaymentsZeroStakeUnsettledAmount)
 	Current.ParseBoolFlag(ctx, FlagPaymentsDuringSessionDebug)
 	Current.ParseUInt64Flag(ctx, FlagPaymentsAmountDuringSessionDebug)
+	Current.ParseStringFlag(ctx, FlagObserverAddress)
+
+	Current.ParseDurationFlag(ctx, FlagPaymentsProviderInvoiceFrequency)
+	Current.ParseDurationFlag(ctx, FlagPaymentsLimitProviderInvoiceFrequency)
+
+	Current.ParseStringFlag(ctx, FlagPaymentsLimitUnpaidInvoiceValue)
+	Current.ParseStringFlag(ctx, FlagPaymentsUnpaidInvoiceValue)
 }

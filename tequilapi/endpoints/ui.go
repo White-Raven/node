@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
 	"github.com/mysteriumnetwork/node/ui/versionmanager"
 )
@@ -41,18 +42,19 @@ func NewNodeUIEndpoints(versionManager *versionmanager.VersionManager) *NodeUIEn
 
 // RemoteVersions list node UI releases from repo
 // swagger:operation GET /ui/remote-versions UI uiRemoteVersions
-// ---
-// summary: List local
-// description: provides a list of node UI releases from github repository
-// responses:
-//   200:
-//     description: Remote version list
-//     schema:
-//       "$ref": "#/definitions/RemoteVersionsResponse"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
+//
+//	---
+//	summary: List local
+//	description: provides a list of node UI releases from github repository
+//	responses:
+//	  200:
+//	    description: Remote version list
+//	    schema:
+//	      "$ref": "#/definitions/RemoteVersionsResponse"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (n *NodeUIEndpoints) RemoteVersions(c *gin.Context) {
 	r := versionmanager.RemoteVersionRequest{
 		PerPage: 50,
@@ -72,7 +74,7 @@ func (n *NodeUIEndpoints) RemoteVersions(c *gin.Context) {
 
 	versions, err := n.versionManager.ListRemoteVersions(r)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, contract.InternalError(err))
+		c.Error(err)
 		return
 	}
 	c.JSON(http.StatusOK, contract.RemoteVersionsResponse{Versions: versions})
@@ -80,22 +82,23 @@ func (n *NodeUIEndpoints) RemoteVersions(c *gin.Context) {
 
 // LocalVersions locally available node UI versions
 // swagger:operation GET /ui/local-versions UI uiLocalVersions
-// ---
-// summary: List remote
-// description: provides a list of node UI releases that have been downloaded or bundled with node
-// responses:
-//   200:
-//     description: Local version list
-//     schema:
-//       "$ref": "#/definitions/LocalVersionsResponse"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
+//
+//	---
+//	summary: List remote
+//	description: provides a list of node UI releases that have been downloaded or bundled with node
+//	responses:
+//	  200:
+//	    description: Local version list
+//	    schema:
+//	      "$ref": "#/definitions/LocalVersionsResponse"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (n *NodeUIEndpoints) LocalVersions(c *gin.Context) {
 	versions, err := n.versionManager.ListLocalVersions()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, contract.InternalError(err))
+		c.Error(apierror.Internal("Could not list local versions: "+err.Error(), contract.ErrCodeUILocalVersions))
 		return
 	}
 	c.JSON(http.StatusOK, contract.LocalVersionsResponse{Versions: versions})
@@ -103,34 +106,39 @@ func (n *NodeUIEndpoints) LocalVersions(c *gin.Context) {
 
 // SwitchVersion switches node UI version to locally available one
 // swagger:operation POST /ui/switch-version UI uiSwitchVersion
-// ---
-// summary: Switch Version
-// description: switch node UI version to locally available one
-// responses:
-//   200:
-//     description: version switched
-//   400:
-//     description: bad request
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
+//
+//	---
+//	summary: Switch Version
+//	description: switch node UI version to locally available one
+//	responses:
+//	  200:
+//	    description: version switched
+//	  400:
+//	    description: Failed to parse or request validation failed
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  422:
+//	    description: Unable to process the request at this point
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (n *NodeUIEndpoints) SwitchVersion(c *gin.Context) {
 	var req contract.SwitchNodeUIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, contract.InvalidRequestError(err))
+		c.Error(apierror.ParseFailed())
 		return
 	}
 
 	if err := req.Valid(); err != nil {
-		c.JSON(http.StatusBadRequest, contract.WithErrorResponse(fmt.Sprintf("could not switch to node UI version: %s", req.Version), err))
+		c.Error(err)
 		return
 	}
 
 	if err := n.versionManager.SwitchTo(req.Version); err != nil {
-		c.JSON(http.StatusBadRequest, contract.WithErrorResponse(fmt.Sprintf("could not switch to node UI version: %s", req.Version), err))
+		c.Error(apierror.Unprocessable(fmt.Sprintf("Could not switch to node UI version: %s", req.Version), contract.ErrCodeUISwitchVersion))
 		return
 	}
 
@@ -139,36 +147,35 @@ func (n *NodeUIEndpoints) SwitchVersion(c *gin.Context) {
 
 // Download download a remote node UI release
 // swagger:operation POST /ui/download-version UI uiDownload
-// ---
-// summary: Download
-// description: download a remote node UI release
-// responses:
-//   200:
-//     description: download in progress
-//   400:
-//     description: bad request
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
+//
+//	---
+//	summary: Download
+//	description: download a remote node UI release
+//	responses:
+//	  200:
+//	    description: Download in progress
+//	  400:
+//	    description: Failed to parse or request validation failed
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (n *NodeUIEndpoints) Download(c *gin.Context) {
 	var req contract.DownloadNodeUIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, contract.WithErrorResponse("could not parse request", err))
+		c.Error(apierror.ParseFailed())
 		return
 	}
 
 	if err := req.Valid(); err != nil {
-		c.JSON(http.StatusBadRequest, contract.InvalidRequestError(err))
+		c.Error(err)
 		return
 	}
 
 	if err := n.versionManager.Download(req.Version); err != nil {
-		c.JSON(http.StatusInternalServerError, contract.WithErrorResponse(
-			fmt.Sprintf("could not download node UI version: %s", req.Version), err,
-		))
+		c.Error(apierror.Internal(fmt.Sprintf("Could not download node UI version: %s", req.Version), contract.ErrCodeUIDownload))
 		return
 	}
 
@@ -177,46 +184,48 @@ func (n *NodeUIEndpoints) Download(c *gin.Context) {
 
 // DownloadStatus returns download status
 // swagger:operation GET /ui/download-status UI uiDownloadStatus
-// ---
-// summary: Download status
-// description: DownloadStatus can download one remote release at a time. This endpoint provides status of the download.
-// responses:
-//   200:
-//     description: download status
-//     schema:
-//       "$ref": "#/definitions/DownloadStatus"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
+//
+//	---
+//	summary: Download status
+//	description: DownloadStatus can download one remote release at a time. This endpoint provides status of the download.
+//	responses:
+//	  200:
+//	    description: download status
+//	    schema:
+//	      "$ref": "#/definitions/DownloadStatus"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (n *NodeUIEndpoints) DownloadStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, n.versionManager.DownloadStatus())
 }
 
 // UI returns download status
 // swagger:operation GET /ui/info UI ui
-// ---
-// summary: Node UI information
-// description: Node UI information
-// responses:
-//   200:
-//     description: Node UI information
-//     schema:
-//       "$ref": "#/definitions/UI"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorResponse"
+//
+//	---
+//	summary: Node UI information
+//	description: Node UI information
+//	responses:
+//	  200:
+//	    description: Node UI information
+//	    schema:
+//	      "$ref": "#/definitions/UI"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (n *NodeUIEndpoints) UI(c *gin.Context) {
 	bundled, err := n.versionManager.BundledVersion()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, contract.InternalError(err))
+		c.Error(apierror.Internal("Could not resolve bundled version: "+err.Error(), contract.ErrCodeUIBundledVersion))
 		return
 	}
 
 	used, err := n.versionManager.UsedVersion()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, contract.InternalError(err))
+		c.Error(apierror.Internal("Could not resolve used version: "+err.Error(), contract.ErrCodeUIUsedVersion))
 		return
 	}
 	c.JSON(http.StatusOK, contract.UI{

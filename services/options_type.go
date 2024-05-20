@@ -20,30 +20,42 @@ package services
 import (
 	"encoding/json"
 
+	"github.com/pkg/errors"
+
 	"github.com/mysteriumnetwork/node/core/service"
+	"github.com/mysteriumnetwork/node/services/datatransfer"
+	"github.com/mysteriumnetwork/node/services/dvpn"
 	"github.com/mysteriumnetwork/node/services/noop"
 	"github.com/mysteriumnetwork/node/services/openvpn"
 	openvpn_service "github.com/mysteriumnetwork/node/services/openvpn/service"
+	"github.com/mysteriumnetwork/node/services/scraping"
 	"github.com/mysteriumnetwork/node/services/wireguard"
 	wireguard_service "github.com/mysteriumnetwork/node/services/wireguard/service"
-	"github.com/pkg/errors"
 )
 
-var (
-	// JSONParsersByType parsers of service specific options from JSON request.
-	JSONParsersByType = map[string]ServiceOptionsParser{
-		noop.ServiceType:      noop.ParseJSONOptions,
-		openvpn.ServiceType:   openvpn_service.ParseJSONOptions,
-		wireguard.ServiceType: wireguard_service.ParseJSONOptions,
-	}
-)
+// JSONParsersByType parsers of service specific options from JSON request.
+var JSONParsersByType = map[string]ServiceOptionsParser{
+	noop.ServiceType:         noop.ParseJSONOptions,
+	openvpn.ServiceType:      openvpn_service.ParseJSONOptions,
+	wireguard.ServiceType:    wireguard_service.ParseJSONOptions,
+	scraping.ServiceType:     wireguard_service.ParseJSONOptions,
+	datatransfer.ServiceType: wireguard_service.ParseJSONOptions,
+	dvpn.ServiceType:         wireguard_service.ParseJSONOptions,
+}
 
 // ServiceOptionsParser parses request to service specific options
 type ServiceOptionsParser func(*json.RawMessage) (service.Options, error)
 
 // Types returns all possible service types.
 func Types() []string {
-	return []string{openvpn.ServiceType, wireguard.ServiceType, noop.ServiceType}
+	return []string{
+		openvpn.ServiceType,
+		wireguard.ServiceType,
+		noop.ServiceType,
+		scraping.ServiceType,
+		datatransfer.ServiceType,
+		dvpn.ServiceType,
+	}
 }
 
 // TypeConfiguredOptions returns specific service options.
@@ -55,6 +67,12 @@ func TypeConfiguredOptions(serviceType string) (service.Options, error) {
 		return wireguard_service.GetOptions(), nil
 	case noop.ServiceType:
 		return noop.GetOptions(), nil
+	case scraping.ServiceType:
+		return wireguard_service.GetOptions(), nil
+	case datatransfer.ServiceType:
+		return wireguard_service.GetOptions(), nil
+	case dvpn.ServiceType:
+		return wireguard_service.GetOptions(), nil
 	default:
 		return nil, errors.Errorf("unknown service type: %q", serviceType)
 	}

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -112,7 +113,7 @@ type PaymentEngineFactory func(providerID, consumerID identity.Identity, chainID
 
 // PriceValidator allows to validate prices against those in discovery.
 type PriceValidator interface {
-	IsPriceValid(in market.Price, nodeType string, country string) bool
+	IsPriceValid(in market.Price, nodeType string, country string, serviceType string) bool
 }
 
 // PaymentEngine is responsible for interacting with the consumer in regard to payments.
@@ -169,6 +170,18 @@ func (manager *SessionManager) Start(request *pb.SessionRequest) (_ pb.SessionRe
 		return pb.SessionResponse{}, fmt.Errorf("cannot create new session: %w", err)
 	}
 
+	prices := manager.remapPricing(request.Consumer.Pricing)
+
+	var validationError error
+	validationWG := sync.WaitGroup{}
+	validationWG.Add(1)
+	go func() {
+		trace := session.tracer.StartStage("Session validation")
+		validationError = manager.validateSession(session, prices)
+		session.tracer.EndStage(trace)
+		validationWG.Done()
+	}()
+
 	rt := reftracker.Singleton()
 	chID := "channel:" + manager.channel.ID()
 
@@ -196,11 +209,15 @@ func (manager *SessionManager) Start(request *pb.SessionRequest) (_ pb.SessionRe
 		log.Debug().Msgf("Provider connection trace: %s", traceResult)
 	}()
 
-	prices := manager.remapPricing(request.Consumer.Pricing)
+	validationWG.Wait()
+	if validationError != nil {
+		return pb.SessionResponse{}, validationError
+	}
 
 	if err = manager.startSession(session, prices); err != nil {
 		return pb.SessionResponse{}, err
 	}
+
 	if err = manager.paymentLoop(session, prices); err != nil {
 		return pb.SessionResponse{}, err
 	}
@@ -208,8 +225,8 @@ func (manager *SessionManager) Start(request *pb.SessionRequest) (_ pb.SessionRe
 	return manager.providerService(session, manager.channel)
 }
 
-func (manager *SessionManager) validatePrice(in market.Price, nodeType, country string) error {
-	if !manager.priceValidator.IsPriceValid(in, nodeType, country) {
+func (manager *SessionManager) validatePrice(in market.Price, nodeType, country, serviceType string) error {
+	if !manager.priceValidator.IsPriceValid(in, nodeType, country, serviceType) {
 		return errors.New("consumer asking for invalid price")
 	}
 
@@ -249,10 +266,6 @@ func (manager *SessionManager) startSession(session *Session, prices market.Pric
 	trace := session.tracer.StartStage("Provider session create (start)")
 	defer session.tracer.EndStage(trace)
 
-	if err := manager.validateSession(session, prices); err != nil {
-		return err
-	}
-
 	manager.clearStaleSession(session.ConsumerID, manager.service.Type)
 
 	manager.sessionStorage.Add(session)
@@ -267,11 +280,11 @@ func (manager *SessionManager) startSession(session *Session, prices market.Pric
 }
 
 func (manager *SessionManager) validateSession(session *Session, prices market.Price) error {
-	if !manager.service.Policies().IsIdentityAllowed(session.ConsumerID) {
+	if !manager.service.PolicyProvider().IsIdentityAllowed(session.ConsumerID) {
 		return fmt.Errorf("consumer identity is not allowed: %s", session.ConsumerID.Address)
 	}
 
-	return manager.validatePrice(prices, manager.service.Proposal.Location.IPType, manager.service.Proposal.Location.Country)
+	return manager.validatePrice(prices, manager.service.Proposal.Location.IPType, manager.service.Proposal.Location.Country, manager.service.Proposal.ServiceType)
 }
 
 func (manager *SessionManager) clearStaleSession(consumerID identity.Identity, serviceType string) {
@@ -410,7 +423,7 @@ func (manager *SessionManager) sendKeepAlivePing(channel p2p.Channel, sessionID 
 	_, err := channel.Send(ctx, p2p.TopicKeepAlive, p2p.ProtoMessage(msg))
 	manager.publisher.Publish(quality.AppTopicProviderPingP2P, quality.PingEvent{
 		SessionID: string(sessionID),
-		Duration:  time.Now().Sub(start),
+		Duration:  time.Since(start),
 	})
 
 	return err

@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/urfave/cli/v2"
@@ -163,7 +164,7 @@ var (
 			"Address of specific Quality Oracle adapter given in '--%s'",
 			FlagQualityType.Name,
 		),
-		Value: "https://quality.mysterium.network/api/v2",
+		Value: "https://quality.mysterium.network/api/v3",
 	}
 	// FlagTequilapiAddress IP address of interface to listen for incoming connections.
 	FlagTequilapiAddress = cli.StringFlag{
@@ -207,30 +208,34 @@ var (
 		Usage: "Enables pprof",
 		Value: false,
 	}
-	// FlagUIEnable enables built-in web UI for node.
-	FlagUIEnable = cli.BoolFlag{
-		Name:  "ui.enable",
-		Usage: "Enables the Web UI",
-		Value: true,
-	}
-	// FlagUIAddress IP address of interface to listen for incoming connections.
-	FlagUIAddress = cli.StringFlag{
-		Name:  "ui.address",
-		Usage: "IP address to bind Web UI to. Address can be comma delimited: '192.168.1.10,192.168.1.20'. (default - 127.0.0.1 and local LAN IP)",
-		Value: "",
-	}
-	// FlagUIPort runs web UI on the specified port.
-	FlagUIPort = cli.IntFlag{
-		Name:  "ui.port",
-		Usage: "The port to run Web UI on",
-		Value: 4449,
-	}
 	// FlagUserMode allows running node under current user without sudo.
 	FlagUserMode = cli.BoolFlag{
 		Name:  "usermode",
 		Usage: "Run as a regular user. Delegate elevated commands to the supervisor.",
 		Value: false,
 	}
+
+	// FlagDVPNMode allows running node in a kernelspace without establishing system-wite tunnels.
+	FlagDVPNMode = cli.BoolFlag{
+		Name:  "dvpnmode",
+		Usage: "Run in a kernelspace without establishing system-wite tunnels",
+		Value: false,
+	}
+
+	// FlagProxyMode allows running node under current user as a proxy.
+	FlagProxyMode = cli.BoolFlag{
+		Name:  "proxymode",
+		Usage: "Run as a regular user as a proxy",
+		Value: false,
+	}
+
+	// FlagUserspace allows running a node without privileged permissions.
+	FlagUserspace = cli.BoolFlag{
+		Name:  "userspace",
+		Usage: "Run a node without privileged permissions",
+		Value: false,
+	}
+
 	// FlagVendorID identifies 3rd party vendor (distributor) of Mysterium node.
 	FlagVendorID = cli.StringFlag{
 		Name: "vendor.id",
@@ -260,7 +265,7 @@ var (
 
 	// FlagDefaultCurrency sets the default currency used in node
 	FlagDefaultCurrency = cli.StringFlag{
-		Name:   "default-currency",
+		Name:   metadata.FlagNames.DefaultCurrency,
 		Usage:  "Default currency used in node and apps that depend on it",
 		Value:  metadata.DefaultNetwork.DefaultCurrency,
 		Hidden: true, // Users are not meant to touch or see this.
@@ -287,6 +292,12 @@ var (
 		Name:  "resident-country",
 		Usage: "set resident country. If not set initially a default country will be resolved.",
 	}
+
+	// FlagWireguardMTU sets Wireguard myst interface MTU.
+	FlagWireguardMTU = cli.IntFlag{
+		Name:  "wireguard.mtu",
+		Usage: "Wireguard interface MTU",
+	}
 )
 
 // RegisterFlagsNode function register node flags to flag list
@@ -298,11 +309,15 @@ func RegisterFlagsNode(flags *[]cli.Flag) error {
 	RegisterFlagsLocation(flags)
 	RegisterFlagsNetwork(flags)
 	RegisterFlagsTransactor(flags)
+	RegisterFlagsAffiliator(flags)
 	RegisterFlagsPayments(flags)
 	RegisterFlagsPolicy(flags)
 	RegisterFlagsMMN(flags)
 	RegisterFlagsPilvytis(flags)
 	RegisterFlagsChains(flags)
+	RegisterFlagsUI(flags)
+	RegisterFlagsBlockchainNetwork(flags)
+	RegisterFlagsSSE(flags)
 
 	*flags = append(*flags,
 		&FlagBindAddress,
@@ -331,10 +346,10 @@ func RegisterFlagsNode(flags *[]cli.Flag) error {
 		&FlagTequilapiUsername,
 		&FlagTequilapiPassword,
 		&FlagPProfEnable,
-		&FlagUIEnable,
-		&FlagUIAddress,
-		&FlagUIPort,
 		&FlagUserMode,
+		&FlagDVPNMode,
+		&FlagProxyMode,
+		&FlagUserspace,
 		&FlagVendorID,
 		&FlagLauncherVersion,
 		&FlagP2PListenPorts,
@@ -343,6 +358,7 @@ func RegisterFlagsNode(flags *[]cli.Flag) error {
 		&FlagDocsURL,
 		&FlagDNSResolutionHeadstart,
 		&FlagResidentCountry,
+		&FlagWireguardMTU,
 	)
 
 	return nil
@@ -355,11 +371,16 @@ func ParseFlagsNode(ctx *cli.Context) {
 	ParseFlagsLocation(ctx)
 	ParseFlagsNetwork(ctx)
 	ParseFlagsTransactor(ctx)
+	ParseFlagsAffiliator(ctx)
 	ParseFlagsPayments(ctx)
 	ParseFlagsPolicy(ctx)
 	ParseFlagsMMN(ctx)
 	ParseFlagPilvytis(ctx)
 	ParseFlagsChains(ctx)
+	ParseFlagsUI(ctx)
+	ParseFlagsSSE(ctx)
+	//it is important to have this one at the end so it overwrites defaults correctly
+	ParseFlagsBlockchainNetwork(ctx)
 
 	Current.ParseStringFlag(ctx, FlagBindAddress)
 	Current.ParseStringSliceFlag(ctx, FlagDiscoveryType)
@@ -387,10 +408,10 @@ func ParseFlagsNode(ctx *cli.Context) {
 	Current.ParseStringFlag(ctx, FlagTequilapiUsername)
 	Current.ParseStringFlag(ctx, FlagTequilapiPassword)
 	Current.ParseBoolFlag(ctx, FlagPProfEnable)
-	Current.ParseBoolFlag(ctx, FlagUIEnable)
-	Current.ParseStringFlag(ctx, FlagUIAddress)
-	Current.ParseIntFlag(ctx, FlagUIPort)
 	Current.ParseBoolFlag(ctx, FlagUserMode)
+	Current.ParseBoolFlag(ctx, FlagDVPNMode)
+	Current.ParseBoolFlag(ctx, FlagProxyMode)
+	Current.ParseBoolFlag(ctx, FlagUserspace)
 	Current.ParseStringFlag(ctx, FlagVendorID)
 	Current.ParseStringFlag(ctx, FlagLauncherVersion)
 	Current.ParseStringFlag(ctx, FlagP2PListenPorts)
@@ -398,6 +419,7 @@ func ParseFlagsNode(ctx *cli.Context) {
 	Current.ParseStringFlag(ctx, FlagDefaultCurrency)
 	Current.ParseStringFlag(ctx, FlagDocsURL)
 	Current.ParseDurationFlag(ctx, FlagDNSResolutionHeadstart)
+	Current.ParseIntFlag(ctx, FlagWireguardMTU)
 
 	ValidateAddressFlags(FlagTequilapiAddress)
 }
@@ -411,4 +433,19 @@ func ValidateAddressFlags(flags ...cli.StringFlag) {
 		log.Warn().Msgf("Possible security vulnerability by flag `%s`, `%s` might be reachable from outside! "+
 			"Ensure its set to localhost or protected by firewall.", flag.Name, flag.Value)
 	}
+}
+
+// ValidateWireguardMTUFlag validates given mtu flag
+func ValidateWireguardMTUFlag() error {
+
+	v := Current.GetInt(FlagWireguardMTU.Name)
+	if v == 0 {
+		return nil
+	}
+	if v < 68 || v > 1500 {
+		msg := "Wireguard MTU value is out of possible range: 68..1500"
+		log.Error().Msg(msg)
+		return errors.Errorf("Flag validation error: %s", msg)
+	}
+	return nil
 }

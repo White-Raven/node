@@ -21,11 +21,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/mysteriumnetwork/node/config/remote"
+	"github.com/mysteriumnetwork/payments/exchange"
 
 	"github.com/mysteriumnetwork/node/cmd/commands/cli/clio"
 	"github.com/mysteriumnetwork/node/config"
@@ -76,9 +77,9 @@ func (c *cliApp) gateways(args []string) (err error) {
 		return
 	}
 
-	resp, err := c.tequilapi.PaymentOrderGateways()
+	resp, err := c.tequilapi.PaymentOrderGateways(exchange.CurrencyMYST)
 	if err != nil {
-		return fmt.Errorf("Could not get currencies: %w", err)
+		return fmt.Errorf("could not get currencies: %w", err)
 	}
 
 	for _, gw := range resp {
@@ -110,13 +111,13 @@ func (c *cliApp) orderCreate(args []string) (err error) {
 
 	f, err := strconv.ParseFloat(argAmount, 64)
 	if err != nil {
-		return fmt.Errorf("Could not parse amount: %w", err)
+		return fmt.Errorf("could not parse amount: %w", err)
 	}
 	if f <= 0 {
-		return errors.New("Top-up amount is required and must be greater than 0")
+		return errors.New("top-up amount is required and must be greater than 0")
 	}
 
-	gws, err := c.tequilapi.PaymentOrderGateways()
+	gws, err := c.tequilapi.PaymentOrderGateways(exchange.CurrencyMYST)
 	if err != nil {
 		clio.Info("Failed to get enabled gateways and their information")
 		return
@@ -134,7 +135,7 @@ func (c *cliApp) orderCreate(args []string) (err error) {
 	}
 	if gw.OrderOptions.Minimum != 0 && f <= gw.OrderOptions.Minimum {
 		return fmt.Errorf(
-			"Top-up amount must be greater than %v%s",
+			"top-up amount must be greater than %v%s",
 			gw.OrderOptions.Minimum,
 			config.GetString(config.FlagDefaultCurrency))
 	}
@@ -177,7 +178,7 @@ func (c *cliApp) orderCreate(args []string) (err error) {
 			CallerData:  callerData,
 		})
 	if err != nil {
-		return fmt.Errorf("Could not create an order: %w", err)
+		return fmt.Errorf("could not create an order: %w", err)
 	}
 
 	printOrder(resp, c.config)
@@ -194,7 +195,7 @@ func (c *cliApp) orderGet(args []string) (err error) {
 
 	resp, err := c.tequilapi.OrderGet(identity.FromAddress(args[0]), args[1])
 	if err != nil {
-		return fmt.Errorf("Could not get an order: %w", err)
+		return fmt.Errorf("could not get an order: %w", err)
 	}
 	printOrder(resp, c.config)
 	return nil
@@ -210,7 +211,7 @@ func (c *cliApp) orderGetAll(args []string) (err error) {
 
 	resp, err := c.tequilapi.OrderGetAll(identity.FromAddress(args[0]))
 	if err != nil {
-		return fmt.Errorf("Could not get orders: %w", err)
+		return fmt.Errorf("could not get orders: %w", err)
 	}
 
 	if len(resp) == 0 {
@@ -237,11 +238,11 @@ func (c *cliApp) invoice(args []string) (err error) {
 
 	resp, err := c.tequilapi.OrderInvoice(identity.FromAddress(args[0]), args[1])
 	if err != nil {
-		return fmt.Errorf("Could not get an order invoice: %w", err)
+		return fmt.Errorf("could not get an order invoice: %w", err)
 	}
 	filename := fmt.Sprintf("invoice-%v.pdf", args[1])
 	clio.Info("Writing invoice to", filename)
-	return ioutil.WriteFile(filename, resp, 0644)
+	return os.WriteFile(filename, resp, 0644)
 }
 
 func printOrder(o contract.PaymentOrderResponse, rc *remote.Config) {

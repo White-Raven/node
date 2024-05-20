@@ -18,7 +18,6 @@
 package pingpong
 
 import (
-	"io/ioutil"
 	"math/big"
 	"os"
 	"sync"
@@ -52,10 +51,6 @@ func (mpems *MockPeerExchangeMessageSender) Send(em crypto.ExchangeMessage) erro
 }
 
 func Test_InvoicePayer_Start_Stop(t *testing.T) {
-	dir, err := ioutil.TempDir("", "exchange_message_tracker_test")
-	assert.Nil(t, err)
-	defer os.RemoveAll(dir)
-
 	ks := identity.NewMockKeystore()
 	acc, err := ks.NewAccount("")
 	assert.Nil(t, err)
@@ -65,12 +60,8 @@ func Test_InvoicePayer_Start_Stop(t *testing.T) {
 	}
 
 	invoiceChan := make(chan crypto.Invoice)
-	bolt, err := boltdb.NewStorage(dir)
-	assert.Nil(t, err)
-	defer bolt.Close()
-
 	tracker := session.NewTracker(mbtime.Now)
-	totalsStorage := NewConsumerTotalsStorage(bolt, eventbus.New())
+	totalsStorage := NewConsumerTotalsStorage(eventbus.New())
 	deps := InvoicePayerDeps{
 		InvoiceChan:               invoiceChan,
 		PeerExchangeMessageSender: mockSender,
@@ -95,7 +86,7 @@ func Test_InvoicePayer_Start_Stop(t *testing.T) {
 }
 
 func Test_InvoicePayer_SendsMessage(t *testing.T) {
-	dir, err := ioutil.TempDir("", "exchange_message_tracker_test")
+	dir, err := os.MkdirTemp("", "exchange_message_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -116,7 +107,7 @@ func Test_InvoicePayer_SendsMessage(t *testing.T) {
 	defer bolt.Close()
 
 	tracker := session.NewTracker(mbtime.Now)
-	totalsStorage := NewConsumerTotalsStorage(bolt, eventbus.New())
+	totalsStorage := NewConsumerTotalsStorage(eventbus.New())
 	totalsStorage.Store(1, identity.FromAddress(acc.Address.Hex()), common.Address{}, big.NewInt(10))
 	deps := InvoicePayerDeps{
 		InvoiceChan:               invoiceChan,
@@ -164,7 +155,7 @@ func Test_InvoicePayer_SendsMessage(t *testing.T) {
 }
 
 func Test_InvoicePayer_SendsMessage_OnFreeService(t *testing.T) {
-	dir, err := ioutil.TempDir("", "exchange_message_tracker_test")
+	dir, err := os.MkdirTemp("", "exchange_message_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -185,7 +176,7 @@ func Test_InvoicePayer_SendsMessage_OnFreeService(t *testing.T) {
 	defer bolt.Close()
 
 	tracker := session.NewTracker(mbtime.Now)
-	totalsStorage := NewConsumerTotalsStorage(bolt, eventbus.New())
+	totalsStorage := NewConsumerTotalsStorage(eventbus.New())
 	totalsStorage.Store(1, identity.FromAddress(acc.Address.Hex()), common.Address{}, big.NewInt(0))
 	deps := InvoicePayerDeps{
 		InvoiceChan:               invoiceChan,
@@ -231,7 +222,7 @@ func Test_InvoicePayer_SendsMessage_OnFreeService(t *testing.T) {
 }
 
 func Test_InvoicePayer_BubblesErrors(t *testing.T) {
-	dir, err := ioutil.TempDir("", "exchange_message_tracker_test")
+	dir, err := os.MkdirTemp("", "exchange_message_tracker_test")
 	assert.Nil(t, err)
 	defer os.RemoveAll(dir)
 
@@ -249,7 +240,7 @@ func Test_InvoicePayer_BubblesErrors(t *testing.T) {
 	defer bolt.Close()
 
 	tracker := session.NewTracker(mbtime.Now)
-	totalsStorage := NewConsumerTotalsStorage(bolt, eventbus.New())
+	totalsStorage := NewConsumerTotalsStorage(eventbus.New())
 	deps := InvoicePayerDeps{
 		InvoiceChan:               invoiceChan,
 		EventBus:                  mocks.NewEventBus(),
@@ -375,11 +366,10 @@ func TestInvoicePayer_incrementGrandTotalPromised(t *testing.T) {
 			want:    new(big.Int),
 		},
 		{
-			name: "adds to zero if not found",
+			name: "adds to zero if no previous value",
 			fields: fields{
 				consumerTotalsStorage: &mockConsumerTotalsStorage{
 					bus: eventbus.New(),
-					err: ErrNotFound,
 				},
 			},
 			args: args{
@@ -776,6 +766,23 @@ func (mcts *mockConsumerTotalsStorage) Store(chainID int64, id identity.Identity
 		})
 	}
 	return nil
+}
+
+func (mcts *mockConsumerTotalsStorage) Add(chainID int64, id identity.Identity, hermesID common.Address, amount *big.Int) error {
+	prevAmount := big.NewInt(0)
+	if mcts.res != nil {
+		prevAmount = mcts.res
+	}
+	mcts.calledWith = new(big.Int).Add(prevAmount, amount)
+	if mcts.bus != nil {
+		go mcts.bus.Publish(event.AppTopicGrandTotalChanged, event.AppEventGrandTotalChanged{
+			ChainID:    chainID,
+			Current:    amount,
+			HermesID:   hermesID,
+			ConsumerID: id,
+		})
+	}
+	return mcts.err
 }
 
 func (mcts *mockConsumerTotalsStorage) Get(chainID int64, id identity.Identity, hermesID common.Address) (*big.Int, error) {

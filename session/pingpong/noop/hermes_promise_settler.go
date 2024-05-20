@@ -29,12 +29,12 @@ type NoopHermesPromiseSettler struct {
 }
 
 // ForceSettle does nothing.
-func (n *NoopHermesPromiseSettler) ForceSettle(chainID int64, _ identity.Identity, _ common.Address) error {
+func (n *NoopHermesPromiseSettler) ForceSettle(chainID int64, _ identity.Identity, _ ...common.Address) error {
 	return nil
 }
 
 // SettleIntoStake does nothing.
-func (n *NoopHermesPromiseSettler) SettleIntoStake(chainID int64, providerID identity.Identity, accountantID common.Address) error {
+func (n *NoopHermesPromiseSettler) SettleIntoStake(chainID int64, providerID identity.Identity, accountantID ...common.Address) error {
 	return nil
 }
 
@@ -50,5 +50,15 @@ func (n *NoopHermesPromiseSettler) GetHermesFee(chainID int64, _ common.Address)
 
 // Withdraw does absolutely nothing.
 func (n *NoopHermesPromiseSettler) Withdraw(fromChainID int64, toChainID int64, providerID identity.Identity, hermesID, beneficiary common.Address, amount *big.Int) error {
+	return nil
+}
+
+// CheckLatestWithdrawal does absolutely nothing.
+func (n *NoopHermesPromiseSettler) CheckLatestWithdrawal(chainID int64, providerID identity.Identity, hermesID common.Address) (*big.Int, string, error) {
+	return nil, "", nil
+}
+
+// RetryWithdrawLatest does absolutely nothing.
+func (n *NoopHermesPromiseSettler) RetryWithdrawLatest(chainID int64, amountToWithdraw *big.Int, chid string, beneficiary common.Address, providerID identity.Identity) error {
 	return nil
 }

@@ -25,16 +25,17 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/mysteriumnetwork/node/session/pingpong"
+	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 
 	"github.com/mysteriumnetwork/node/consumer/session"
 	nodeEvent "github.com/mysteriumnetwork/node/core/node/event"
+	"github.com/mysteriumnetwork/node/core/state/event"
 	stateEvent "github.com/mysteriumnetwork/node/core/state/event"
 	"github.com/mysteriumnetwork/node/eventbus"
+	"github.com/mysteriumnetwork/node/session/pingpong"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
 )
 
 // EventType represents all the event types we're subscribing to
@@ -68,6 +69,7 @@ type Handler struct {
 
 type stateProvider interface {
 	GetState() stateEvent.State
+	GetConnection(string) stateEvent.Connection
 }
 
 // NewSSEHandler returns a new instance of handler
@@ -125,13 +127,14 @@ func (h *Handler) Sub(c *gin.Context) {
 
 	h.newClients <- messageChan
 
-	go func() {
-		<-req.Context().Done()
+	defer func() {
 		h.deadClients <- messageChan
 	}()
 
 	for {
 		select {
+		case <-req.Context().Done():
+			return
 		case msg, open := <-messageChan:
 			if !open {
 				return
@@ -139,7 +142,7 @@ func (h *Handler) Sub(c *gin.Context) {
 
 			_, err := fmt.Fprintf(resp, "data: %s\n\n", msg)
 			if err != nil {
-				log.Error().Err(err).Msg("")
+				log.Error().Err(err).Msg("failed to print data in response")
 				return
 			}
 
@@ -181,7 +184,11 @@ func (h *Handler) serve() {
 			close(s)
 		case msg := <-h.messages:
 			for s := range h.clients {
-				s <- msg
+				// non-locking send to each client
+				select {
+				case s <- msg:
+				default:
+				}
 			}
 		}
 	}
@@ -225,46 +232,61 @@ type consumerStateRes struct {
 	Connection contract.ConnectionDTO `json:"connection"`
 }
 
-func mapState(event stateEvent.State) stateRes {
-	identitiesRes := make([]contract.IdentityDTO, len(event.Identities))
-	for idx, identity := range event.Identities {
+func mapState(state stateEvent.State) stateRes {
+	identitiesRes := make([]contract.IdentityDTO, len(state.Identities))
+	for idx, identity := range state.Identities {
 		stake := new(big.Int)
 
-		if channel := identityChannel(identity.Address, event.ProviderChannels); channel != nil {
+		if channel := identityChannel(identity.Address, state.ProviderChannels); channel != nil {
 			stake = channel.Channel.Stake
 		}
 
 		identitiesRes[idx] = contract.IdentityDTO{
-			Address:            identity.Address,
-			RegistrationStatus: identity.RegistrationStatus.String(),
-			ChannelAddress:     identity.ChannelAddress.Hex(),
-			Balance:            identity.Balance,
-			BalanceTokens:      contract.NewTokens(identity.Balance),
-			Earnings:           identity.Earnings,
-			EarningsTotal:      identity.EarningsTotal,
-			Stake:              stake,
-			HermesID:           identity.HermesID.Hex(),
+			Address:             identity.Address,
+			RegistrationStatus:  identity.RegistrationStatus.String(),
+			ChannelAddress:      identity.ChannelAddress.Hex(),
+			Balance:             identity.Balance,
+			BalanceTokens:       contract.NewTokens(identity.Balance),
+			Earnings:            identity.Earnings,
+			EarningsTokens:      contract.NewTokens(identity.Earnings),
+			EarningsTotal:       identity.EarningsTotal,
+			EarningsTotalTokens: contract.NewTokens(identity.EarningsTotal),
+			Stake:               stake,
+			HermesID:            identity.HermesID.Hex(),
+			EarningsPerHermes:   contract.NewEarningsPerHermesDTO(identity.EarningsPerHermes),
 		}
 	}
 
-	channelsRes := make([]contract.PaymentChannelDTO, len(event.ProviderChannels))
-	for idx, channel := range event.ProviderChannels {
+	channelsRes := make([]contract.PaymentChannelDTO, len(state.ProviderChannels))
+	for idx, channel := range state.ProviderChannels {
 		channelsRes[idx] = contract.NewPaymentChannelDTO(channel)
 	}
 
-	sessionsRes := make([]contract.SessionDTO, len(event.Sessions))
+	sessionsRes := make([]contract.SessionDTO, len(state.Sessions))
 	sessionsStats := session.NewStats()
-	for idx, se := range event.Sessions {
+	for idx, se := range state.Sessions {
 		sessionsRes[idx] = contract.NewSessionDTO(se)
 		sessionsStats.Add(se)
 	}
 
+	conn := event.Connection{Session: connectionstate.Status{State: connectionstate.NotConnected}}
+
+	for k, c := range state.Connections {
+		if c.Session.State == "" {
+			c.Session.State = connectionstate.NotConnected
+		}
+		conn = c
+		if len(k) > 0 {
+			break
+		}
+	}
+
 	res := stateRes{
-		Services:      event.Services,
+		Services:      state.Services,
 		Sessions:      sessionsRes,
 		SessionsStats: contract.NewSessionStatsDTO(sessionsStats),
 		Consumer: consumerStateRes{
-			Connection: contract.NewConnectionDTO(event.Connection.Session, event.Connection.Statistics, event.Connection.Throughput, event.Connection.Invoice),
+			Connection: contract.NewConnectionDTO(conn.Session, conn.Statistics, conn.Throughput, conn.Invoice),
 		},
 		Identities: identitiesRes,
 		Channels:   channelsRes,

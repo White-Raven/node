@@ -18,6 +18,7 @@
 package mysterium
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -52,7 +53,7 @@ func (mb *MobileNode) GetIdentity(req *GetIdentityRequest) (*GetIdentityResponse
 		return nil, fmt.Errorf("could not unlock identity: %w", err)
 	}
 
-	channelAddress, err := mb.identityChannelCalculator.GetChannelAddress(mb.chainID, id)
+	channelAddress, err := mb.identityChannelCalculator.GetActiveChannelAddress(mb.chainID, id.ToCommonAddress())
 	if err != nil {
 		return nil, fmt.Errorf("could not generate channel address: %w", err)
 	}
@@ -160,7 +161,7 @@ func (mb *MobileNode) IsFreeRegistrationEligible(identityAddress string) (bool, 
 
 // RegistrationTokenReward returns the reward amount for a given token.
 func (mb *MobileNode) RegistrationTokenReward(token string) (float64, error) {
-	reward, err := mb.transactor.RegistrationTokenReward(token)
+	reward, err := mb.affiliator.RegistrationTokenReward(token)
 	if err != nil {
 		return 0, err
 	}
@@ -169,4 +170,41 @@ func (mb *MobileNode) RegistrationTokenReward(token string) (float64, error) {
 	}
 
 	return crypto.BigMystToFloat(reward), nil
+}
+
+// MigrateHermes migrate from old to active Hermes
+func (mb *MobileNode) MigrateHermes(id string) error {
+	return mb.hermesMigrator.Start(id)
+}
+
+const (
+	// MigrationStatusRequired means new there is new Hermes and identity required to migrate to it
+	MigrationStatusRequired = "required"
+	// MigrationStatusFinished means migration to new Hermes finished or not needed
+	MigrationStatusFinished = "finished"
+)
+
+// MigrationStatusResponse represents status of the migration
+type MigrationStatusResponse struct {
+	Status MigrationStatus `json:"status"`
+}
+
+// MigrationStatus status of the migration
+type MigrationStatus = string
+
+// MigrateHermesStatus migrate from old to active Hermes
+func (mb *MobileNode) MigrateHermesStatus(id string) ([]byte, error) {
+	r, err := mb.hermesMigrator.IsMigrationRequired(id)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	var status MigrationStatus
+	if r {
+		status = MigrationStatusRequired
+	} else {
+		status = MigrationStatusFinished
+	}
+
+	return json.Marshal(MigrationStatusResponse{Status: status})
 }

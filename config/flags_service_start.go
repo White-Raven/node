@@ -18,6 +18,8 @@
 package config
 
 import (
+	"strings"
+
 	"github.com/urfave/cli/v2"
 )
 
@@ -60,6 +62,21 @@ var (
 		Usage: "Sets the price/hour applied to provider service.",
 		Value: 0.00006,
 	}
+
+	// FlagActiveServices a comma-separated list of active services.
+	FlagActiveServices = cli.StringFlag{
+		Name:  "active-services",
+		Usage: "Comma separated list of active services.",
+		Value: strings.Join([]string{"scraping", "data_transfer", "dvpn"}, ","),
+	}
+
+	// FlagStoppedServices a comma-separated list of stopped services.
+	FlagStoppedServices = cli.StringFlag{
+		Name:   "stopped-services",
+		Usage:  "Comma separated list of stopped services.",
+		Value:  strings.Join([]string{}, ","),
+		Hidden: true,
+	}
 )
 
 // RegisterFlagsServiceStart registers CLI flags used to start a service.
@@ -71,6 +88,8 @@ func RegisterFlagsServiceStart(flags *[]cli.Flag) {
 		&FlagPaymentPriceGiB,
 		&FlagPaymentPriceHour,
 		&FlagAccessPolicyList,
+		&FlagActiveServices,
+		&FlagStoppedServices,
 	)
 }
 
@@ -82,4 +101,6 @@ func ParseFlagsServiceStart(ctx *cli.Context) {
 	Current.ParseFloat64Flag(ctx, FlagPaymentPriceGiB)
 	Current.ParseFloat64Flag(ctx, FlagPaymentPriceHour)
 	Current.ParseStringFlag(ctx, FlagAccessPolicyList)
+	Current.ParseStringFlag(ctx, FlagActiveServices)
+	Current.ParseStringFlag(ctx, FlagStoppedServices)
 }

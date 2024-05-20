@@ -20,23 +20,23 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
-
 	"github.com/mysteriumnetwork/node/cmd/commands/cli/clio"
 	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/core/beneficiary"
 	"github.com/mysteriumnetwork/node/core/node"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/money"
-	"github.com/mysteriumnetwork/payments/crypto"
+	"github.com/mysteriumnetwork/payments/units"
 )
 
 func (c *cliApp) identities(args []string) (err error) {
@@ -50,14 +50,15 @@ func (c *cliApp) identities(args []string) (err error) {
 		"  " + usageUnlockIdentity,
 		"  " + usageRegisterIdentity,
 		"  " + usageSettle,
-		"  " + usageSetPayoutAddress,
-		"  " + usageGetPayoutAddress,
 		"  " + usageSetBeneficiary,
 		"  " + usageSetBeneficiaryStatus,
 		"  " + usageGetReferralCode,
 		"  " + usageExportIdentity,
 		"  " + usageImportIdentity,
 		"  " + usageWithdraw,
+		"  " + usageLastWithdrawal,
+		"  " + usageMigrateHermesStatus,
+		"  " + usageMigrateHermes,
 	}, "\n")
 
 	if len(args) == 0 {
@@ -83,10 +84,6 @@ func (c *cliApp) identities(args []string) (err error) {
 		return c.registerIdentity(actionArgs)
 	case "settle":
 		return c.settle(actionArgs)
-	case "set-payout-address":
-		return c.setPayoutAddress(actionArgs)
-	case "get-payout-address":
-		return c.getPayoutAddress(actionArgs)
 	case "beneficiary-set":
 		return c.setBeneficiary(actionArgs)
 	case "beneficiary-status":
@@ -99,6 +96,12 @@ func (c *cliApp) identities(args []string) (err error) {
 		return c.importIdentity(actionArgs)
 	case "withdraw":
 		return c.withdraw(actionArgs)
+	case "last-withdrawal":
+		return c.lastWithdrawal(actionArgs)
+	case "migrate-hermes":
+		return c.migrateHermes(actionArgs)
+	case "migrate-hermes-status":
+		return c.migrateHermesStatus(actionArgs)
 	default:
 		fmt.Println(usage)
 		return errUnknownSubCommand(args[0])
@@ -136,11 +139,8 @@ func (c *cliApp) getBalance(actionArgs []string) (err error) {
 	if err != nil {
 		return err
 	}
-	if balance.Balance == nil {
-		balance.Balance = new(big.Int)
-	}
 
-	clio.Info(fmt.Sprintf("Balance: %s", money.New(balance.Balance)))
+	clio.Info(fmt.Sprintf("Balance: %s MYST", balance.BalanceTokens))
 	return nil
 }
 
@@ -157,9 +157,9 @@ func (c *cliApp) getIdentity(actionArgs []string) (err error) {
 	if err != nil {
 		return err
 	}
-	clio.Info("Registration Status:", identityStatus.RegistrationStatus)
-	clio.Info("Channel address:", identityStatus.ChannelAddress)
-	clio.Info(fmt.Sprintf("Balance: %s", money.New(identityStatus.Balance)))
+	clio.Info("Registration Status: ", identityStatus.RegistrationStatus)
+	clio.Info("Channel address: ", identityStatus.ChannelAddress)
+	clio.Info(fmt.Sprintf("Balance: %s MYST", identityStatus.BalanceTokens))
 	clio.Info(fmt.Sprintf("Earnings: %s", money.New(identityStatus.Earnings)))
 	clio.Info(fmt.Sprintf("Earnings total: %s", money.New(identityStatus.EarningsTotal)))
 	return nil
@@ -199,7 +199,7 @@ func (c *cliApp) unlockIdentity(actionArgs []string) (err error) {
 		passphrase = actionArgs[1]
 	}
 
-	clio.Info("Unlocking", address)
+	clio.Info("Unlocking ", address)
 	err = c.tequilapi.Unlock(address, passphrase)
 	if err != nil {
 		return err
@@ -209,21 +209,26 @@ func (c *cliApp) unlockIdentity(actionArgs []string) (err error) {
 	return nil
 }
 
-const usageRegisterIdentity = "register <identity> [referralcode]"
+const usageRegisterIdentity = "register <identity> [beneficiary] [referralcode]"
 
 func (c *cliApp) registerIdentity(actionArgs []string) error {
-	if len(actionArgs) < 1 || len(actionArgs) > 2 {
+	if len(actionArgs) < 1 || len(actionArgs) > 3 {
 		clio.Info("Usage: " + usageRegisterIdentity)
 		return errWrongArgumentCount
 	}
 
 	address := actionArgs[0]
-	var token *string
+	var beneficiary string
 	if len(actionArgs) >= 2 {
-		token = &actionArgs[1]
+		beneficiary = actionArgs[1]
 	}
 
-	err := c.tequilapi.RegisterIdentity(address, token)
+	var token *string
+	if len(actionArgs) >= 3 {
+		token = &actionArgs[2]
+	}
+
+	err := c.tequilapi.RegisterIdentity(address, beneficiary, token)
 	if err != nil {
 		return fmt.Errorf("could not register identity: %w", err)
 	}
@@ -235,33 +240,49 @@ func (c *cliApp) registerIdentity(actionArgs []string) error {
 	return nil
 }
 
-const usageSettle = "settle <providerIdentity>"
+const usageSettle = "settle <providerIdentity> [hermesID,hermesID2]"
 
 func (c *cliApp) settle(args []string) (err error) {
-	if len(args) != 1 {
+	if len(args) == 0 || len(args) > 2 {
 		clio.Info("Usage: " + usageSettle)
 		fees, err := c.tequilapi.GetTransactorFees()
 		if err != nil {
-			clio.Warn("could not get transactor fee: ", err)
+			clio.Warn("Could not get transactor fee:", err)
 		}
-		trFee := new(big.Float).Quo(new(big.Float).SetInt(fees.Settlement), new(big.Float).SetInt(money.MystSize))
-		hermesFee := new(big.Float).Quo(new(big.Float).SetInt(big.NewInt(int64(fees.Hermes))), new(big.Float).SetInt(money.MystSize))
-		clio.Info(fmt.Sprintf("Transactor fee: %v MYST", trFee.String()))
-		clio.Info(fmt.Sprintf("Hermes fee: %v MYST", hermesFee.String()))
+		clio.Info(fmt.Sprintf("Transactor fee: %s MYST", fees.SettlementTokens))
+
+		hermesPct, err := decimal.NewFromString(fees.HermesPercent)
+		if err != nil {
+			clio.Info("Could not retrieve hermes fee:", err)
+		}
+		clio.Info(fmt.Sprintf("Hermes fee: %s%%", hermesPct.Mul(decimal.NewFromInt(100)).StringFixed(2)))
 		return errWrongArgumentCount
 	}
+
 	hermesID, err := c.config.GetHermesID()
 	if err != nil {
 		return fmt.Errorf("could not get Hermes ID: %w", err)
 	}
+
+	hermesIDs := make([]common.Address, 0)
+	if len(args) == 2 {
+		ids := strings.Split(args[1], ",")
+		for _, h := range ids {
+			hermesIDs = append(hermesIDs, common.HexToAddress(h))
+		}
+	} else {
+		hermesIDs = append(hermesIDs, common.HexToAddress(hermesID))
+	}
+
+	clio.Infof("Will settle with hermes: %v\n", hermesIDs)
 	clio.Info("Waiting for settlement to complete")
 	errChan := make(chan error)
 
 	go func() {
-		errChan <- c.tequilapi.Settle(identity.FromAddress(args[0]), identity.FromAddress(hermesID), true)
+		errChan <- c.tequilapi.Settle(identity.FromAddress(args[0]), hermesIDs, true)
 	}()
 
-	timeout := time.After(time.Minute * 2)
+	timeout := time.After(time.Minute * 5)
 	for {
 		select {
 		case <-timeout:
@@ -280,38 +301,7 @@ func (c *cliApp) settle(args []string) (err error) {
 	}
 }
 
-const usageGetPayoutAddress = "get-payout-address <identity>"
-
-func (c *cliApp) getPayoutAddress(args []string) error {
-	if len(args) != 1 {
-		clio.Info("Usage: " + usageGetPayoutAddress)
-		return errWrongArgumentCount
-	}
-	addr, err := c.tequilapi.GetPayout(args[0])
-	if err != nil {
-		return fmt.Errorf("could not get payout address: %w", err)
-	}
-	clio.Info("Payout address: ", addr.Address)
-	return nil
-}
-
-const usageSetPayoutAddress = "set-payout-address <providerIdentity> <beneficiary>"
-
-func (c *cliApp) setPayoutAddress(args []string) error {
-	if len(args) != 2 {
-		clio.Info("Usage: " + usageSetPayoutAddress)
-		return errWrongArgumentCount
-	}
-	err := c.tequilapi.SetPayout(args[0], args[1])
-	if err != nil {
-		return fmt.Errorf("could not set payout address: %w", err)
-	}
-
-	clio.Info("Payout address set to: ", args[0])
-	return nil
-}
-
-const usageSetBeneficiary = "beneficiary-set <providerIdentity> <beneficiary>"
+const usageSetBeneficiary = "beneficiary-set <providerIdentity> <beneficiary> [hermesID]"
 
 func (c *cliApp) setBeneficiary(actionArgs []string) error {
 	if len(actionArgs) < 2 || len(actionArgs) > 3 {
@@ -321,12 +311,12 @@ func (c *cliApp) setBeneficiary(actionArgs []string) error {
 
 	address := actionArgs[0]
 	benef := actionArgs[1]
-	hermesID, err := c.config.GetHermesID()
-	if err != nil {
-		return err
+	hermesID := ""
+	if len(actionArgs) == 3 {
+		hermesID = actionArgs[2]
 	}
 
-	err = c.tequilapi.SettleWithBeneficiary(address, benef, hermesID)
+	err := c.tequilapi.SettleWithBeneficiary(address, benef, hermesID)
 	if err != nil {
 		return err
 	}
@@ -349,7 +339,7 @@ func (c *cliApp) setBeneficiary(actionArgs []string) error {
 			}
 
 			if st.Error != "" {
-				return fmt.Errorf("Could not set new beneficiary address: %s", st.Error)
+				return fmt.Errorf("could not set new beneficiary address: %s", st.Error)
 			}
 
 			data, err := c.tequilapi.Beneficiary(address)
@@ -380,12 +370,16 @@ func (c *cliApp) getBeneficiaryStatus(actionArgs []string) error {
 	}
 
 	clio.Info(fmt.Sprintf("Current beneficiary: %s", data.Beneficiary))
+	clio.Info(fmt.Sprintf("Is a channel address: %t", data.IsChannelAddress))
 
 	st, err := c.tequilapi.SettleWithBeneficiaryStatus(address)
 	if err != nil {
-		return fmt.Errorf("Could not get beneficiary change status: %w", err)
+		return fmt.Errorf("could not get beneficiary change status: %w", err)
 	}
 
+	if st.State == beneficiary.NotFound {
+		clio.Info("No last change request information")
+	}
 	clio.Info("Last change request information:")
 	clio.Info(fmt.Sprintf("Change to: %s", st.ChangeTo))
 	clio.Info(fmt.Sprintf("State: %s", st.State))
@@ -403,12 +397,14 @@ func (c *cliApp) withdraw(args []string) error {
 		clio.Info("Usage: " + usageWithdraw)
 		fees, err := c.tequilapi.GetTransactorFees()
 		if err != nil {
-			clio.Warn("could not get transactor fee: ", err)
+			clio.Warn("Could not get transactor fee:", err)
 		}
-		trFee := new(big.Float).Quo(new(big.Float).SetInt(fees.Settlement), new(big.Float).SetInt(money.MystSize))
-		hermesFee := new(big.Float).Quo(new(big.Float).SetInt(big.NewInt(int64(fees.Hermes))), new(big.Float).SetInt(money.MystSize))
-		clio.Info(fmt.Sprintf("Transactor fee: %v MYST", trFee.String()))
-		clio.Info(fmt.Sprintf("Hermes fee: %v MYST", hermesFee.String()))
+		clio.Info(fmt.Sprintf("Transactor fee: %s MYST", fees.SettlementTokens))
+		hermesPct, err := decimal.NewFromString(fees.HermesPercent)
+		if err != nil {
+			clio.Info("Could not retrieve hermes fee:", err)
+		}
+		clio.Info(fmt.Sprintf("Hermes fee: %s%%", hermesPct.Mul(decimal.NewFromInt(100)).StringFixed(2)))
 		return errWrongArgumentCount
 	}
 	hermesID, err := c.config.GetHermesID()
@@ -444,7 +440,7 @@ func (c *cliApp) withdraw(args []string) error {
 			return errors.New("max withdrawal amount is 99 MYST")
 		}
 
-		amount = crypto.FloatToBigMyst(amf)
+		amount = units.FloatEthToBigIntWei(amf)
 	}
 
 	clio.Info("Waiting for withdrawal to complete")
@@ -537,7 +533,10 @@ func (c *cliApp) exportIdentity(actionsArgs []string) (err error) {
 	}
 
 	clio.Success("Private key exported: ")
-	fmt.Println(string(blob))
+
+	quoted := strconv.Quote(string(blob))
+	fmt.Println(quoted[1 : len(quoted)-1])
+
 	return nil
 }
 
@@ -554,10 +553,11 @@ func (c *cliApp) importIdentity(actionsArgs []string) (err error) {
 
 	blob := []byte(key)
 	if _, err := os.Stat(key); err == nil {
-		blob, err = ioutil.ReadFile(key)
+		blob, err = os.ReadFile(key)
 		if err != nil {
 			return fmt.Errorf("can't read provided file: %s reason: %w", key, err)
 		}
+		blob = []byte(strings.ReplaceAll(string(blob), `\"`, `"`))
 	}
 
 	id, err := c.tequilapi.ImportIdentity(blob, passphrase, true)
@@ -566,5 +566,77 @@ func (c *cliApp) importIdentity(actionsArgs []string) (err error) {
 	}
 
 	clio.Success("Identity imported:", id.Address)
+	return nil
+}
+
+const usageLastWithdrawal = "last-withdrawal <identity>"
+
+func (c *cliApp) lastWithdrawal(actionArgs []string) error {
+	if len(actionArgs) != 1 {
+		clio.Info("Usage: " + usageLastWithdrawal)
+		return errWrongArgumentCount
+	}
+
+	address := actionArgs[0]
+	history, err := c.tequilapi.WithdrawalHistory(address)
+	if err != nil {
+		return fmt.Errorf("could not get last withdrawal: %w", err)
+	}
+	if history.TotalItems == 0 {
+		clio.Info("No withdrawals found")
+		return nil
+	}
+
+	lastWithdrawal := history.Items[0]
+
+	clio.Info("Tx hash: ", lastWithdrawal.TxHash)
+	clio.Info("DateTime: ", lastWithdrawal.SettledAt)
+	clio.Info("Beneficiary: ", lastWithdrawal.Beneficiary)
+	clio.Info("Amount: ", money.New(lastWithdrawal.Amount))
+	clio.Info("Fees: ", money.New(lastWithdrawal.Fees))
+	clio.Info("Blockchain explorer URL: ", lastWithdrawal.BlockExplorerURL)
+	if lastWithdrawal.Error != "" {
+		clio.Warnf("Error: %s", lastWithdrawal.Error)
+	} else {
+		clio.Info("Error: none")
+	}
+	return nil
+}
+
+const usageMigrateHermesStatus = "migrate-hermes-status <identity>"
+
+func (c *cliApp) migrateHermesStatus(actionArgs []string) error {
+	if len(actionArgs) != 1 {
+		clio.Info("Usage: " + usageMigrateHermesStatus)
+		return errWrongArgumentCount
+	}
+
+	address := actionArgs[0]
+	response, err := c.tequilapi.MigrateHermesStatus(address)
+	if err != nil {
+		return err
+	}
+
+	clio.Info("Migration status: ", response.Status)
+
+	return nil
+}
+
+const usageMigrateHermes = "migrate-hermes <identity>"
+
+func (c *cliApp) migrateHermes(actionArgs []string) error {
+	if len(actionArgs) != 1 {
+		clio.Info("Usage: " + usageMigrateHermes)
+		return errWrongArgumentCount
+	}
+
+	address := actionArgs[0]
+	clio.Info("Migration started")
+	err := c.tequilapi.MigrateHermes(address)
+	if err != nil {
+		return err
+	}
+	clio.Info("Migration finished successfully")
+
 	return nil
 }

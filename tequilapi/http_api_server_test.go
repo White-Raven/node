@@ -33,7 +33,7 @@ func TestLocalAPIServerPortIsAsExpected(t *testing.T) {
 	listener, err := net.Listen("tcp", "localhost:31337")
 	assert.Nil(t, err)
 
-	server, err := NewServer(listener, *node.GetOptions(), []func(e *gin.Engine) error{})
+	server, err := NewServer(listener, *node.GetOptions(), nil, []func(e *gin.Engine) error{})
 	assert.NoError(t, err)
 
 	server.StartServing()
@@ -51,7 +51,7 @@ func TestLocalAPIServerPortIsAsExpected(t *testing.T) {
 func TestStopBeforeStartingListeningDoesNotCausePanic(t *testing.T) {
 	listener, err := net.Listen("tcp", "localhost:31337")
 	assert.Nil(t, err)
-	server, err := NewServer(listener, *node.GetOptions(), []func(e *gin.Engine) error{})
+	server, err := NewServer(listener, *node.GetOptions(), nil, []func(e *gin.Engine) error{})
 	assert.NoError(t, err)
 	server.Stop()
 }

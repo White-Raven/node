@@ -18,7 +18,10 @@
 package eventbus
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -33,4 +36,70 @@ func Test_simplifiedEventBus_Publish_InvokesSubscribers(t *testing.T) {
 	eventBus.Publish("test topic", "test data")
 
 	assert.Equal(t, "test data", received)
+}
+
+type handler struct {
+	val int
+}
+
+func (h *handler) Handle(_ string) {
+	h.val++
+}
+
+func TestUnsubscribeMethod(t *testing.T) {
+	bus := New()
+	h := &handler{val: 0}
+	h2 := &handler{val: 5}
+
+	bus.SubscribeWithUID("topic", "1", h.Handle)
+	bus.SubscribeWithUID("topic", "2", h2.Handle)
+
+	bus.Publish("topic", "1")
+
+	err := bus.UnsubscribeWithUID("topic", "1", h.Handle)
+	assert.NoError(t, err)
+
+	bus.Publish("topic", "2")
+
+	err = bus.UnsubscribeWithUID("topic", "2", h2.Handle)
+	assert.NoError(t, err)
+
+	err = bus.UnsubscribeWithUID("topic", "1", h.Handle)
+	assert.Error(t, err)
+
+	bus.Publish("topic", "3")
+
+	assert.Equal(t, 1, h.val)
+	assert.Equal(t, 7, h2.val)
+}
+
+func Test_simplifiedEventBus_Publish_DataRace(t *testing.T) {
+	eventBus := New()
+
+	fn := func(data string) {}
+
+	active := new(atomic.Bool)
+	active.Store(true)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < 100; i++ {
+			eventBus.SubscribeWithUID("topic", "1", fn)
+			eventBus.Publish("topic", "test data")
+			time.Sleep(time.Millisecond)
+		}
+		active.Store(false)
+	}()
+	go func() {
+		defer wg.Done()
+		for active.Load() == true {
+			eventBus.UnsubscribeWithUID("topic", "1", fn)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	wg.Wait()
 }

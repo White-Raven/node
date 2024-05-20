@@ -53,9 +53,19 @@ func TestConnectionStartStop(t *testing.T) {
 	assert.EqualValues(t, 11, stats.BytesReceived)
 
 	// Stop connection.
+	stopCh := make(chan struct{})
 	go func() {
+		// test auto-create connection during Reconnect
+		conn.connectionEndpoint = nil
+		err = conn.Reconnect(context.Background(), connection.ConnectOptions{
+			Params:        connection.ConnectParams{DNS: "1.2.3.4"},
+			SessionConfig: sessionConfig,
+		})
+		assert.NoError(t, err)
 		conn.Stop()
+		stopCh <- struct{}{}
 	}()
+	<-stopCh
 	assert.NoError(t, err)
 }
 
@@ -145,14 +155,14 @@ func (mce *mockConnectionEndpoint) Config() (wg.ServiceConfig, error)    { retur
 func (mce *mockConnectionEndpoint) AddPeer(_ string, _ wgcfg.Peer) error { return nil }
 func (mce *mockConnectionEndpoint) RemovePeer(_ string) error            { return nil }
 func (mce *mockConnectionEndpoint) ConfigureRoutes(_ net.IP) error       { return nil }
-func (mce *mockConnectionEndpoint) PeerStats() (*wgcfg.Stats, error) {
-	return &wgcfg.Stats{LastHandshake: time.Now(), BytesSent: 10, BytesReceived: 11}, nil
+func (mce *mockConnectionEndpoint) PeerStats() (wgcfg.Stats, error) {
+	return wgcfg.Stats{LastHandshake: time.Now(), BytesSent: 10, BytesReceived: 11}, nil
 }
 
 type mockHandshakeWaiter struct {
 	err error
 }
 
-func (m *mockHandshakeWaiter) Wait(ctx context.Context, statsFetch func() (*wgcfg.Stats, error), timeout time.Duration, stop <-chan struct{}) error {
+func (m *mockHandshakeWaiter) Wait(ctx context.Context, statsFetch func() (wgcfg.Stats, error), timeout time.Duration, stop <-chan struct{}) error {
 	return m.err
 }

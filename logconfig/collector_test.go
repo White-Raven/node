@@ -18,7 +18,6 @@
 package logconfig
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
@@ -46,7 +45,7 @@ func TestCollector_List_ListsAllLogFilesMatchingPattern(t *testing.T) {
 	defer os.Remove(fn3)
 
 	// ensure this is the file with the most recent modified time
-	time.Sleep(time.Millisecond * 2)
+	time.Sleep(time.Millisecond * 10)
 	fn4 := NewTempFileName(t, dn1, logFilename+".gz")
 	defer os.Remove(fn4)
 
@@ -96,13 +95,13 @@ func TestCollector_Archive(t *testing.T) {
 }
 
 func NewTempFileName(t *testing.T, dir, pattern string) string {
-	file, err := ioutil.TempFile(dir, pattern)
+	file, err := os.CreateTemp(dir, pattern)
 	assert.NoError(t, err)
 	return file.Name()
 }
 
 func NewTempDirName(t *testing.T, pattern string) string {
-	dir, err := ioutil.TempDir("", pattern)
+	dir, err := os.MkdirTemp("", pattern)
 	assert.NoError(t, err)
 	return dir
 }

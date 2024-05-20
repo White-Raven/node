@@ -19,14 +19,11 @@ package endpoints
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/gin-gonic/gin"
 
 	"github.com/mysteriumnetwork/node/config"
 
@@ -40,7 +37,7 @@ func Test_EthEndpoints(t *testing.T) {
 	err := config.Current.LoadUserConfig(configFileName)
 	assert.NoError(t, err)
 
-	g := gin.Default()
+	g := summonTestGin()
 	err = AddRoutesForValidator(g)
 	assert.NoError(t, err)
 
@@ -56,12 +53,12 @@ func Test_EthEndpoints(t *testing.T) {
 			expectedResponse: 500,
 		},
 		{
-			payload:          `["https://polygon-mumbai.infura.io/v3/e37e62a5c0c44334967779adf83415c4"]`,
-			configChainId:    80001,
+			payload:          `["https://polygon-amoy1.mysterium.network"]`,
+			configChainId:    80002,
 			expectedResponse: 200,
 		},
 		{
-			payload:          `["https://polygon-mumbai.infura.io/v3/e37e62a5c0c44334967779adf83415c4"]`,
+			payload:          `["https://polygon-amoy1.mysterium.network"]`,
 			configChainId:    1,
 			expectedResponse: 400,
 		},
@@ -82,7 +79,7 @@ func Test_EthEndpoints(t *testing.T) {
 }
 
 func NewTempFileName(t *testing.T) string {
-	file, err := ioutil.TempFile("", "*")
+	file, err := os.CreateTemp("", "*")
 	assert.NoError(t, err)
 	return file.Name()
 }

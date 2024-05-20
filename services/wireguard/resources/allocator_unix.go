@@ -1,5 +1,3 @@
-//go:build !windows
-
 /*
  * Copyright (C) 2018 The "MysteriumNetwork/node" Authors.
  *
@@ -22,6 +20,7 @@ package resources
 import (
 	"fmt"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +65,11 @@ func (a *Allocator) AbandonedInterfaces() ([]net.Interface, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if runtime.GOOS == "android" {
+		list := make([]net.Interface, 0)
+		return list, nil
+	}
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -90,6 +94,10 @@ func (a *Allocator) AbandonedInterfaces() ([]net.Interface, error) {
 func (a *Allocator) AllocateInterface() (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if runtime.GOOS == "android" {
+		return "myst0", nil
+	}
 
 	ifaces, err := net.Interfaces()
 	if err != nil {

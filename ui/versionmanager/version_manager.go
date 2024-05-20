@@ -22,12 +22,11 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
-	godvpnweb "github.com/mysteriumnetwork/go-dvpn-web"
+	godvpnweb "github.com/mysteriumnetwork/go-dvpn-web/v2"
 	"github.com/mysteriumnetwork/node/requests"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
@@ -72,7 +71,7 @@ func NewVersionManager(
 func (vm *VersionManager) ListLocalVersions() ([]LocalVersion, error) {
 	var versions = make([]LocalVersion, 0)
 
-	files, err := ioutil.ReadDir(vm.versionConfig.uiDir())
+	files, err := os.ReadDir(vm.versionConfig.uiDir())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return versions, nil
@@ -188,10 +187,12 @@ func (vm *VersionManager) Download(versionName string) error {
 
 // SwitchTo switch to serving specific version
 func (vm *VersionManager) SwitchTo(versionName string) error {
-	log.Info().Msgf("switching node UI to version: %s", versionName)
+	log.Info().Msgf("Switching node UI to version: %s", versionName)
 
 	if versionName == BundledVersionName {
-		vm.versionConfig.write(nodeUIVersion{VersionName: BundledVersionName})
+		if err := vm.versionConfig.write(nodeUIVersion{VersionName: BundledVersionName}); err != nil {
+			return err
+		}
 		vm.uiServer.SwitchUI(BundledVersionName)
 		return nil
 	}
@@ -202,7 +203,9 @@ func (vm *VersionManager) SwitchTo(versionName string) error {
 	}
 	for _, lv := range local {
 		if lv.Name == versionName {
-			vm.versionConfig.write(nodeUIVersion{VersionName: versionName})
+			if err := vm.versionConfig.write(nodeUIVersion{VersionName: versionName}); err != nil {
+				return err
+			}
 			vm.uiServer.SwitchUI(vm.versionConfig.UIBuildPath(versionName))
 			return nil
 		}

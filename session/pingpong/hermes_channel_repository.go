@@ -18,30 +18,41 @@
 package pingpong
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/node/config"
-	nodevent "github.com/mysteriumnetwork/node/core/node/event"
+	nodeEvent "github.com/mysteriumnetwork/node/core/node/event"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
-	"github.com/mysteriumnetwork/node/session/pingpong/event"
-	pinge "github.com/mysteriumnetwork/node/session/pingpong/event"
+	pingEvent "github.com/mysteriumnetwork/node/session/pingpong/event"
 	"github.com/mysteriumnetwork/payments/client"
 	"github.com/mysteriumnetwork/payments/crypto"
-	"github.com/rs/zerolog/log"
 )
 
 type promiseProvider interface {
 	Get(chainID int64, channelID string) (HermesPromise, error)
 	List(filter HermesPromiseFilter) ([]HermesPromise, error)
+	Store(promise HermesPromise) error
 }
 
 type channelProvider interface {
 	GetProviderChannel(chainID int64, hermesAddress common.Address, addressToCheck common.Address, pending bool) (client.ProviderChannel, error)
+}
+
+type hermesCaller interface {
+	GetProviderData(chainID int64, id string) (HermesUserInfo, error)
+	RefreshLatestProviderPromise(chainID int64, id string, hashlock, recoveryData []byte, signer identity.Signer) (crypto.Promise, error)
+	RevealR(r string, provider string, agreementID *big.Int) error
 }
 
 type beneficiaryProvider interface {
@@ -54,18 +65,26 @@ type HermesChannelRepository struct {
 	channelProvider channelProvider
 	publisher       eventbus.Publisher
 	channels        map[int64][]HermesChannel
+	addressProvider addressProvider
+	hermesCaller    hermesCaller
+	encryption      encryption
 	bprovider       beneficiaryProvider
 	lock            sync.RWMutex
+	signer          identity.SignerFactory
 }
 
 // NewHermesChannelRepository returns a new instance of HermesChannelRepository.
-func NewHermesChannelRepository(promiseProvider promiseProvider, channelProvider channelProvider, publisher eventbus.Publisher, bprovider beneficiaryProvider) *HermesChannelRepository {
+func NewHermesChannelRepository(promiseProvider promiseProvider, channelProvider channelProvider, publisher eventbus.Publisher, bprovider beneficiaryProvider, hermesCaller hermesCaller, addressProvider addressProvider, signer identity.SignerFactory, encryption encryption) *HermesChannelRepository {
 	return &HermesChannelRepository{
 		promiseProvider: promiseProvider,
 		channelProvider: channelProvider,
 		publisher:       publisher,
 		bprovider:       bprovider,
+		hermesCaller:    hermesCaller,
+		addressProvider: addressProvider,
 		channels:        make(map[int64][]HermesChannel, 0),
+		signer:          signer,
+		encryption:      encryption,
 	}
 }
 
@@ -108,7 +127,9 @@ func (hcr *HermesChannelRepository) Get(chainID int64, id identity.Identity, her
 
 	for _, channel := range v {
 		if channel.Identity == id && channel.HermesID == hermesID {
-			return channel, true
+
+			// return a copy!!!
+			return channel.Copy(), true
 		}
 	}
 
@@ -124,23 +145,83 @@ func (hcr *HermesChannelRepository) List(chainID int64) []HermesChannel {
 	if !ok {
 		return nil
 	}
-	return v
+
+	// make a copy of array, so it could be used in other goroutines
+	channelsCopy := make([]HermesChannel, 0)
+	for _, val := range v {
+		channelsCopy = append(channelsCopy, val.Copy())
+	}
+	return channelsCopy
 }
 
-// GetEarnings returns all channels earnings for given identity
-func (hcr *HermesChannelRepository) GetEarnings(chainID int64, id identity.Identity) event.Earnings {
+// GetEarnings returns all channels earnings for given identity combined from all hermeses possible
+func (hcr *HermesChannelRepository) GetEarnings(chainID int64, id identity.Identity) pingEvent.Earnings {
 	hcr.lock.RLock()
 	defer hcr.lock.RUnlock()
 
 	return hcr.sumChannels(chainID, id)
 }
 
-func (hcr *HermesChannelRepository) sumChannels(chainID int64, id identity.Identity) event.Earnings {
+// GetEarningsDetailed returns earnings in a detailed format grouping them by hermes ID but also providing totals.
+func (hcr *HermesChannelRepository) GetEarningsDetailed(chainID int64, id identity.Identity) *pingEvent.EarningsDetailed {
+	hcr.lock.RLock()
+	defer hcr.lock.RUnlock()
+
+	return hcr.sumChannelsDetailed(chainID, id)
+}
+
+func (hcr *HermesChannelRepository) sumChannelsDetailed(chainID int64, id identity.Identity) *pingEvent.EarningsDetailed {
+	result := &pingEvent.EarningsDetailed{
+		Total: pingEvent.Earnings{
+			LifetimeBalance:  new(big.Int),
+			UnsettledBalance: new(big.Int),
+		},
+		PerHermes: make(map[common.Address]pingEvent.Earnings),
+	}
+
+	v, ok := hcr.channels[chainID]
+	if !ok {
+		return result
+	}
+
+	add := func(current pingEvent.Earnings, channel HermesChannel) pingEvent.Earnings {
+		life := new(big.Int).Add(current.LifetimeBalance, channel.LifetimeBalance())
+		unset := new(big.Int).Add(current.UnsettledBalance, channel.UnsettledBalance())
+
+		// Save total globally per all hermeses
+		current.LifetimeBalance = life
+		current.UnsettledBalance = unset
+
+		return current
+	}
+
+	for _, channel := range v {
+		if channel.Identity != id {
+			continue
+		}
+		result.Total = add(result.Total, channel)
+
+		// Save total for a single hermes
+		got, ok := result.PerHermes[channel.HermesID]
+		if !ok {
+			got = pingEvent.Earnings{
+				LifetimeBalance:  new(big.Int),
+				UnsettledBalance: new(big.Int),
+			}
+		}
+
+		result.PerHermes[channel.HermesID] = add(got, channel)
+	}
+
+	return result
+}
+
+func (hcr *HermesChannelRepository) sumChannels(chainID int64, id identity.Identity) pingEvent.Earnings {
 	var lifetimeBalance = new(big.Int)
 	var unsettledBalance = new(big.Int)
 	v, ok := hcr.channels[chainID]
 	if !ok {
-		return event.Earnings{
+		return pingEvent.Earnings{
 			LifetimeBalance:  new(big.Int),
 			UnsettledBalance: new(big.Int),
 		}
@@ -153,7 +234,7 @@ func (hcr *HermesChannelRepository) sumChannels(chainID int64, id identity.Ident
 		}
 	}
 
-	return event.Earnings{
+	return pingEvent.Earnings{
 		LifetimeBalance:  lifetimeBalance,
 		UnsettledBalance: unsettledBalance,
 	}
@@ -161,18 +242,22 @@ func (hcr *HermesChannelRepository) sumChannels(chainID int64, id identity.Ident
 
 // Subscribe subscribes to the appropriate events.
 func (hcr *HermesChannelRepository) Subscribe(bus eventbus.Subscriber) error {
-	err := bus.SubscribeAsync(nodevent.AppTopicNode, hcr.handleNodeStart)
+	err := bus.SubscribeAsync(nodeEvent.AppTopicNode, hcr.handleNodeStart)
 	if err != nil {
 		return fmt.Errorf("could not subscribe to node status event: %w", err)
 	}
-	err = bus.SubscribeAsync(pinge.AppTopicHermesPromise, hcr.handleHermesPromiseReceived)
+	err = bus.SubscribeAsync(pingEvent.AppTopicHermesPromise, hcr.handleHermesPromiseReceived)
 	if err != nil {
 		return fmt.Errorf("could not subscribe to AppTopicHermesPromise event: %w", err)
+	}
+	err = bus.SubscribeAsync(identity.AppTopicIdentityUnlock, hcr.handleIdentityUnlock)
+	if err != nil {
+		return fmt.Errorf("could not subscribe to AppTopicIdentityUnlock event: %w", err)
 	}
 	return nil
 }
 
-func (hcr *HermesChannelRepository) handleHermesPromiseReceived(payload pinge.AppEventHermesPromise) {
+func (hcr *HermesChannelRepository) handleHermesPromiseReceived(payload pingEvent.AppEventHermesPromise) {
 	channelID, err := crypto.GenerateProviderChannelID(payload.ProviderID.Address, payload.HermesID.Hex())
 	if err != nil {
 		log.Err(err).Msg("could not generate provider channel id")
@@ -185,17 +270,128 @@ func (hcr *HermesChannelRepository) handleHermesPromiseReceived(payload pinge.Ap
 		return
 	}
 
-	err = hcr.updateChannelWithLatestPromise(payload.Promise.ChainID, promise.ChannelID, payload.ProviderID, payload.HermesID, promise)
+	// use parameter "protectChannels" to protect channels on update
+	err = hcr.updateChannelWithLatestPromise(payload.Promise.ChainID, promise.ChannelID, payload.ProviderID, payload.HermesID, promise, true)
 	if err != nil {
 		log.Err(err).Msg("could not update channel state with latest hermes promise")
 	}
 }
 
-func (hcr *HermesChannelRepository) handleNodeStart(payload nodevent.Payload) {
-	if payload.Status != nodevent.StatusStarted {
+func (hcr *HermesChannelRepository) handleNodeStart(payload nodeEvent.Payload) {
+	if payload.Status != nodeEvent.StatusStarted {
 		return
 	}
 	hcr.fetchKnownChannels(config.GetInt64(config.FlagChainID))
+}
+
+func (hcr *HermesChannelRepository) handleIdentityUnlock(payload identity.AppEventIdentityUnlock) {
+	hermes, err := hcr.addressProvider.GetActiveHermes(payload.ChainID)
+	if err != nil {
+		log.Err(err).Msg("failed to get active Hermes")
+		return
+	}
+	hermesChannel, exists := hcr.Get(payload.ChainID, payload.ID, hermes)
+	if exists {
+		return
+	}
+
+	unsettledBalance := hermesChannel.UnsettledBalance()
+	if unsettledBalance.Cmp(big.NewInt(0)) != 0 {
+		return
+	}
+
+	data, err := hcr.hermesCaller.GetProviderData(payload.ChainID, payload.ID.Address)
+	if err != nil {
+		log.Err(err).Msg("failed to get provider data")
+		return
+	}
+
+	//skip refresh if promise has been revealed or we know r
+	if data.LatestPromise.Hashlock != "" {
+		hermesPromise, err := hcr.promiseProvider.Get(payload.ChainID, data.ChannelID)
+		if err == nil && strings.EqualFold(data.LatestPromise.Hashlock, fmt.Sprintf("0x%s", common.Bytes2Hex(hermesPromise.Promise.Hashlock))) {
+			err = hcr.revealR(hermesPromise)
+			if err == nil {
+				return
+			}
+			log.Error().Err(err).Msgf("failed to reveal R on identity unlock")
+		}
+	}
+
+	if data.LatestPromise.Amount != nil && data.LatestPromise.Amount.Cmp(big.NewInt(0)) != 0 {
+		R, err := crypto.GenerateR()
+		if err != nil {
+			log.Err(err).Msg("failed to generate R")
+			return
+		}
+		hashlock := ethcrypto.Keccak256(R)
+		details := rRecoveryDetails{
+			R:           hex.EncodeToString(R),
+			AgreementID: big.NewInt(0),
+		}
+
+		bytes, err := json.Marshal(details)
+		if err != nil {
+			log.Err(err).Msgf("could not marshal R recovery details")
+			return
+		}
+
+		encrypted, err := hcr.encryption.Encrypt(payload.ID.ToCommonAddress(), bytes)
+		if err != nil {
+			log.Err(err).Msgf("could not encrypt R")
+			return
+		}
+		signer := hcr.signer(payload.ID)
+		promise, err := hcr.hermesCaller.RefreshLatestProviderPromise(config.GetInt64(config.FlagChainID), payload.ID.Address, hashlock, encrypted, signer)
+		if err != nil {
+			log.Err(err).Msgf("failed to refresh promise")
+			return
+		}
+		hermesPromise := HermesPromise{
+			R:         hex.EncodeToString(R),
+			ChannelID: data.ChannelID,
+			Identity:  identity.FromAddress(data.Identity),
+			HermesID:  hermes,
+			Promise:   promise,
+			Revealed:  false,
+		}
+
+		err = hcr.promiseProvider.Store(hermesPromise)
+		if err != nil {
+			log.Err(err).Msg("could not store hermes promise")
+			return
+		}
+		hcr.publisher.Publish(pingEvent.AppTopicHermesPromise, pingEvent.AppEventHermesPromise{
+			Promise:    promise,
+			HermesID:   hermes,
+			ProviderID: identity.FromAddress(data.Identity),
+		})
+
+		err = hcr.revealR(hermesPromise)
+		if err != nil {
+			log.Err(err).Msgf("failed to reveal R after promise refresh")
+		}
+		log.Debug().Bool("saved", err == nil).Msg("refreshed promise")
+	}
+}
+
+func (hcr *HermesChannelRepository) revealR(hermesPromise HermesPromise) error {
+	if hermesPromise.Revealed {
+		return nil
+	}
+
+	err := hcr.hermesCaller.RevealR(hermesPromise.R, hermesPromise.Identity.Address, hermesPromise.AgreementID)
+	if err != nil {
+		return fmt.Errorf("could not reveal R: %w", err)
+	}
+
+	hermesPromise.Revealed = true
+	err = hcr.promiseProvider.Store(hermesPromise)
+	if err != nil && !errors.Is(err, ErrAttemptToOverwrite) {
+		return fmt.Errorf("could not store hermes promise: %w", err)
+	}
+
+	return nil
 }
 
 func (hcr *HermesChannelRepository) fetchKnownChannels(chainID int64) {
@@ -211,6 +407,21 @@ func (hcr *HermesChannelRepository) fetchKnownChannels(chainID int64) {
 	}
 
 	for _, promise := range promises {
+		gen, err := crypto.GenerateProviderChannelID(promise.Identity.Address, promise.HermesID.Hex())
+		if err != nil {
+			log.Err(err).Msg("could not generate a provider channel address")
+			continue
+		}
+		if strings.ToLower(gen) != strings.ToLower(promise.ChannelID) {
+			log.Debug().Fields(map[string]interface{}{
+				"identity":           promise.Identity.Address,
+				"expected_channelID": gen,
+				"got_channelID":      promise.ChannelID,
+				"hermes":             promise.HermesID.Hex(),
+			}).Msg("promise channel ID did not match provider channel ID, skipping")
+			continue
+		}
+
 		if _, err := hcr.fetchChannel(chainID, promise.ChannelID, promise.Identity, promise.HermesID, promise); err != nil {
 			log.Error().Err(err).Msg("could not load initial earnings state")
 		}
@@ -226,21 +437,19 @@ func (hcr *HermesChannelRepository) fetchChannel(chainID int64, channelID string
 		return HermesChannel{}, fmt.Errorf("could not get provider channel for %v, hermes %v: %w", id, hermesID.Hex(), err)
 	}
 
-	hermesChannel := NewHermesChannel(channelID, id, hermesID, channel, promise)
-
 	benef, err := hcr.bprovider.GetBeneficiary(id.ToCommonAddress())
 	if err != nil {
 		return HermesChannel{}, fmt.Errorf("could not get provider beneficiary for %v, hermes %v: %w", id, hermesID.Hex(), err)
 	}
-
-	hermesChannel.Beneficiary = benef
+	hermesChannel := NewHermesChannel(channelID, id, hermesID, channel, promise, benef).
+		Copy()
 
 	hcr.updateChannel(chainID, hermesChannel)
 
 	return hermesChannel, nil
 }
 
-func (hcr *HermesChannelRepository) updateChannelWithLatestPromise(chainID int64, channelID string, id identity.Identity, hermesID common.Address, promise HermesPromise) error {
+func (hcr *HermesChannelRepository) updateChannelWithLatestPromise(chainID int64, channelID string, id identity.Identity, hermesID common.Address, promise HermesPromise, protectChannels bool) error {
 	gotten, ok := hcr.Get(chainID, id, hermesID)
 	if !ok {
 		// this actually performs the update, so no need to do anything
@@ -248,13 +457,21 @@ func (hcr *HermesChannelRepository) updateChannelWithLatestPromise(chainID int64
 		return err
 	}
 
-	hermesChannel := NewHermesChannel(channelID, id, hermesID, gotten.Channel, promise)
+	hermesChannel := NewHermesChannel(channelID, id, hermesID, gotten.Channel, promise, gotten.Beneficiary).
+		Copy()
+
+	// protect hcr.channels: handleHermesPromiseReceived -> updateChannelWithLatestPromise -> updateChannel
+	if protectChannels {
+		hcr.lock.Lock()
+		defer hcr.lock.Unlock()
+	}
 	hcr.updateChannel(chainID, hermesChannel)
+
 	return nil
 }
 
 func (hcr *HermesChannelRepository) updateChannel(chainID int64, new HermesChannel) {
-	earningsOld := hcr.sumChannels(chainID, new.Identity)
+	earningsOld := hcr.sumChannelsDetailed(chainID, new.Identity)
 
 	updated := false
 
@@ -262,6 +479,7 @@ func (hcr *HermesChannelRepository) updateChannel(chainID int64, new HermesChann
 	for i, channel := range v {
 		if channel.Identity == new.Identity && channel.HermesID == new.HermesID {
 			updated = true
+			// rewrites element in array. to prevent data race on array elements - use its deep-copy in other goroutines
 			hcr.channels[chainID][i] = new
 			break
 		}
@@ -280,10 +498,10 @@ func (hcr *HermesChannelRepository) updateChannel(chainID int64, new HermesChann
 		new.UnsettledBalance(),
 	)
 
-	earningsNew := hcr.sumChannels(chainID, new.Identity)
-	go hcr.publisher.Publish(event.AppTopicEarningsChanged, event.AppEventEarningsChanged{
+	earningsNew := hcr.sumChannelsDetailed(chainID, new.Identity)
+	go hcr.publisher.Publish(pingEvent.AppTopicEarningsChanged, pingEvent.AppEventEarningsChanged{
 		Identity: new.Identity,
-		Previous: earningsOld,
-		Current:  earningsNew,
+		Previous: *earningsOld,
+		Current:  *earningsNew,
 	})
 }

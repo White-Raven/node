@@ -19,10 +19,13 @@ package config
 
 import (
 	"flag"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/mysteriumnetwork/node/services/datatransfer"
+	"github.com/mysteriumnetwork/node/services/dvpn"
+	"github.com/mysteriumnetwork/node/services/scraping"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/urfave/cli/v2"
@@ -38,7 +41,7 @@ func TestUserConfig_Load(t *testing.T) {
 		[openvpn]
 		port = 31338
 	`
-	err := ioutil.WriteFile(configFileName, []byte(toml), 0700)
+	err := os.WriteFile(configFileName, []byte(toml), 0700)
 	assert.NoError(t, err)
 
 	// when
@@ -75,14 +78,14 @@ func TestUserConfig_Save(t *testing.T) {
 	err = cfg.SaveUserConfig()
 	// then: only user configuration values are stored
 	assert.NoError(t, err)
-	tomlContent, err := ioutil.ReadFile(configFileName)
+	tomlContent, err := os.ReadFile(configFileName)
 	assert.NoError(t, err)
 	assert.Contains(t, string(tomlContent), "port = 22822")
 	assert.NotContains(t, string(tomlContent), `proto = "tcp"`)
 }
 
 func NewTempFileName(t *testing.T) string {
-	file, err := ioutil.TempFile("", "*")
+	file, err := os.CreateTemp("", "*")
 	assert.NoError(t, err)
 	return file.Name()
 }
@@ -230,6 +233,11 @@ func TestUserConfig_GetConfig(t *testing.T) {
 		},
 		cfg.GetConfig(),
 	)
+}
+
+func TestHardcodedServicesNameFlagValues(t *testing.T) {
+	// importing these constants into config package create cyclic dependency
+	assert.Equal(t, strings.Join([]string{scraping.ServiceType, datatransfer.ServiceType, dvpn.ServiceType}, ","), FlagActiveServices.Value)
 }
 
 func must(t *testing.T, err error) {

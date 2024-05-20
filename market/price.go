@@ -39,8 +39,16 @@ type PriceHistory struct {
 
 // PriceByType is a slice of pricing by type.
 type PriceByType struct {
-	Residential *Price `json:"residential"`
-	Other       *Price `json:"other"`
+	Residential *PriceByServiceType `json:"residential"`
+	Other       *PriceByServiceType `json:"other"`
+}
+
+// PriceByServiceType is a slice of pricing by service type.
+type PriceByServiceType struct {
+	Wireguard    *Price `json:"wireguard"`
+	Scraping     *Price `json:"scraping"`
+	DataTransfer *Price `json:"data_transfer"`
+	DVPN         *Price `json:"dvpn"`
 }
 
 // Price represents the price.

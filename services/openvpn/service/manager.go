@@ -83,8 +83,8 @@ func (m *Manager) Serve(instance *service.Instance) (err error) {
 	dnsPort := 11153
 	dnsHandler, err := dns.ResolveViaSystem()
 	if err == nil {
-		if instance.Policies().HasDNSRules() {
-			dnsHandler = dns.WhitelistAnswers(dnsHandler, m.trafficFirewall, instance.Policies())
+		if instance.PolicyProvider().HasDNSRules() {
+			dnsHandler = dns.WhitelistAnswers(dnsHandler, m.trafficFirewall, instance.PolicyProvider())
 			removeRule, err := m.trafficFirewall.BlockIncomingTraffic(m.vpnNetwork)
 			if err != nil {
 				return fmt.Errorf("failed to enable traffic blocking: %w", err)
@@ -138,11 +138,9 @@ func (m *Manager) Serve(instance *service.Instance) (err error) {
 	}
 
 	if _, err := m.natService.Setup(nat.Options{
-		VPNNetwork:        m.vpnNetwork,
-		ProviderExtIP:     net.ParseIP(m.outboundIP),
-		EnableDNSRedirect: m.dnsOK,
-		DNSIP:             m.dnsIP,
-		DNSPort:           dnsPort,
+		VPNNetwork:    m.vpnNetwork,
+		ProviderExtIP: net.ParseIP(m.outboundIP),
+		DNSIP:         m.dnsIP,
 	}); err != nil {
 		return fmt.Errorf("failed to setup NAT/firewall rules: %w", err)
 	}
@@ -184,7 +182,7 @@ func (m *Manager) ProvideConfig(sessionID string, sessionConfig json.RawMessage,
 		return nil, fmt.Errorf("could not get public IP: %w", err)
 	}
 
-	serverIP := vpnServerIP(m.outboundIP, publicIP, m.nodeOptions.OptionsNetwork.Localnet)
+	serverIP := vpnServerIP(m.outboundIP, publicIP, m.nodeOptions.OptionsNetwork.Network.IsLocalnet())
 	vpnConfig := &openvpn_service.VPNConfig{
 		RemoteIP:        serverIP,
 		RemotePort:      m.vpnServerPort,

@@ -24,11 +24,12 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/mysteriumnetwork/node/core/ip"
-	"github.com/mysteriumnetwork/node/core/location/locationstate"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/mysteriumnetwork/go-rest/apierror"
+	"github.com/mysteriumnetwork/node/core/ip"
+	"github.com/mysteriumnetwork/node/core/location/locationstate"
 )
 
 type locationResolverMock struct {
@@ -48,6 +49,10 @@ func (r *locationResolverMock) DetectLocation() (locationstate.Location, error) 
 	}
 
 	return loc, nil
+}
+
+func (r *locationResolverMock) DetectProxyLocation(_ int) (locationstate.Location, error) {
+	return r.DetectLocation()
 }
 
 func (r *locationResolverMock) GetOrigin() locationstate.Location {
@@ -92,6 +97,7 @@ func TestAddRoutesForConnectionLocationAddsRoutes(t *testing.T) {
 				"city": "Vilnius",
 				"continent": "EU",
 				"country": "LT",
+				"region": "",
 				"ip": "1.2.3.4",
 				"isp": "Telia Lietuva, AB",
 				"ip_type": "residential"
@@ -105,6 +111,7 @@ func TestAddRoutesForConnectionLocationAddsRoutes(t *testing.T) {
 				"city": "Vilnius",
 				"continent": "EU",
 				"country": "LT",
+				"region": "",
 				"ip": "1.2.3.1",
 				"isp": "Telia Lietuva, AB",
 				"ip_type": "residential"
@@ -152,7 +159,7 @@ func TestGetIPEndpointSucceeds(t *testing.T) {
 
 func TestGetIPEndpointReturnsErrorWhenIPDetectionFails(t *testing.T) {
 	ipResolver := ip.NewResolverMockFailing(errors.New("fake error"))
-	router := gin.Default()
+	router := summonTestGin()
 	err := AddRoutesForConnectionLocation(ipResolver, nil, nil)(router)
 	assert.NoError(t, err)
 	resp := httptest.NewRecorder()
@@ -165,11 +172,5 @@ func TestGetIPEndpointReturnsErrorWhenIPDetectionFails(t *testing.T) {
 	router.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message": "fake error"
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, "unavailable", apierror.Parse(resp.Result()).Err.Code)
 }

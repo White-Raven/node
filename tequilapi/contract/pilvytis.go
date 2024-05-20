@@ -20,80 +20,10 @@ package contract
 import (
 	"encoding/json"
 
+	"github.com/mysteriumnetwork/node/identity"
+
 	"github.com/mysteriumnetwork/node/pilvytis"
 )
-
-// OrderRequest holds order request details
-// swagger:model OrderRequest
-type OrderRequest struct {
-	// example: 3.14
-	MystAmount float64 `json:"myst_amount"`
-
-	// example: EUR
-	PayCurrency string `json:"pay_currency"`
-
-	// example: false
-	LightningNetwork bool `json:"lightning_network"`
-}
-
-// OrderResponse holds order request details
-// swagger:model OrderResponse
-type OrderResponse struct {
-	// example: 1
-	ID uint64 `json:"id"`
-	// example: pending
-	Status string `json:"status"`
-	// example: 0x0000000000000000000000000000000000000002
-	Identity string `json:"identity"`
-
-	// example: 1.1
-	MystAmount float64 `json:"myst_amount"`
-	// example: 1.1
-	PriceAmount *float64 `json:"price_amount"`
-	// example: BTC
-	PriceCurrency string `json:"price_currency"`
-
-	// example: 1.1
-	PayAmount *float64 `json:"pay_amount,omitempty"`
-	// example: BTC
-	PayCurrency *string `json:"pay_currency,omitempty"`
-	// example: 0x0000000000000000000000000000000000000002
-	PaymentAddress string `json:"payment_address"`
-	// example: http://coingate.com/invoice/4949cf0a-fccb-4cc2-9342-7af1890cc664
-	PaymentURL string `json:"payment_url"`
-
-	// example: 1.1
-	ReceiveAmount *float64 `json:"receive_amount"`
-	// example: BTC
-	ReceiveCurrency string `json:"receive_currency"`
-}
-
-// NewOrderResponse creates a new order response
-func NewOrderResponse(r pilvytis.OrderResponse) OrderResponse {
-	return OrderResponse{
-		ID:              r.ID,
-		Status:          string(r.Status),
-		Identity:        r.Identity,
-		MystAmount:      r.MystAmount,
-		PriceAmount:     r.PriceAmount,
-		PriceCurrency:   r.PriceCurrency,
-		PayAmount:       r.PayAmount,
-		PayCurrency:     r.PayCurrency,
-		PaymentAddress:  r.PaymentAddress,
-		PaymentURL:      r.PaymentURL,
-		ReceiveAmount:   r.ReceiveAmount,
-		ReceiveCurrency: r.ReceiveCurrency,
-	}
-}
-
-// NewOrdersResponse creates a slice of orders response
-func NewOrdersResponse(r []pilvytis.OrderResponse) []OrderResponse {
-	result := make([]OrderResponse, len(r))
-	for i := range r {
-		result[i] = NewOrderResponse(r[i])
-	}
-	return result
-}
 
 // PaymentOrderOptions represents pilvytis payment order options
 // swagger:model PaymentOrderOptions
@@ -126,6 +56,7 @@ type PaymentOrderResponse struct {
 	PayAmount   string `json:"pay_amount"`
 	PayCurrency string `json:"pay_currency"`
 	Country     string `json:"country"`
+	State       string `json:"state"`
 
 	Currency      string `json:"currency"`
 	ItemsSubTotal string `json:"items_sub_total"`
@@ -137,7 +68,7 @@ type PaymentOrderResponse struct {
 }
 
 // NewPaymentOrderResponse creates an instance of PaymentOrderResponse
-func NewPaymentOrderResponse(r *pilvytis.PaymentOrderResponse) PaymentOrderResponse {
+func NewPaymentOrderResponse(r *pilvytis.GatewayOrderResponse) PaymentOrderResponse {
 	return PaymentOrderResponse{
 		ID:                r.ID,
 		Status:            string(r.Status),
@@ -149,6 +80,7 @@ func NewPaymentOrderResponse(r *pilvytis.PaymentOrderResponse) PaymentOrderRespo
 		PayAmount:         r.PayAmount,
 		PayCurrency:       r.PayCurrency,
 		Country:           r.Country,
+		State:             r.State,
 		Currency:          r.Currency,
 		ItemsSubTotal:     r.ItemsSubTotal,
 		TaxRate:           r.TaxRate,
@@ -159,12 +91,25 @@ func NewPaymentOrderResponse(r *pilvytis.PaymentOrderResponse) PaymentOrderRespo
 }
 
 // NewPaymentOrdersResponse creates a slice of orders response
-func NewPaymentOrdersResponse(r []pilvytis.PaymentOrderResponse) []PaymentOrderResponse {
+func NewPaymentOrdersResponse(r []pilvytis.GatewayOrderResponse) []PaymentOrderResponse {
 	result := make([]PaymentOrderResponse, len(r))
 	for i := range r {
 		result[i] = NewPaymentOrderResponse(&r[i])
 	}
 	return result
+}
+
+// RegistrationPaymentResponse holds a registration payment order response.
+// swagger:model RegistrationPaymentResponse
+type RegistrationPaymentResponse struct {
+	Paid bool `json:"paid"`
+}
+
+// NewRegistrationPaymentResponse creates a registration order response
+func NewRegistrationPaymentResponse(r *pilvytis.RegistrationPaymentResponse) RegistrationPaymentResponse {
+	return RegistrationPaymentResponse{
+		Paid: r.Paid,
+	}
 }
 
 // GatewaysResponse holds payment gateway details.
@@ -195,12 +140,36 @@ type PaymentOrderRequest struct {
 	// example: 3.14
 	MystAmount string `json:"myst_amount"`
 
+	// example: 20
+	AmountUSD string `json:"amount_usd"`
+
 	// example: EUR
 	PayCurrency string `json:"pay_currency"`
 
 	// example: US
 	Country string `json:"country"`
 
+	// example: MO
+	State string `json:"state"`
+
+	// example: mysteriumvpn, mystnodes
+	ProjectID string `json:"project_id"`
+
 	// example: {}
 	CallerData json.RawMessage `json:"gateway_caller_data"`
+}
+
+// GatewayOrderRequest convenience mapper
+func (o *PaymentOrderRequest) GatewayOrderRequest(identity identity.Identity, gateway string) pilvytis.GatewayOrderRequest {
+	return pilvytis.GatewayOrderRequest{
+		Identity:    identity,
+		Gateway:     gateway,
+		MystAmount:  o.MystAmount,
+		AmountUSD:   o.AmountUSD,
+		PayCurrency: o.PayCurrency,
+		Country:     o.Country,
+		State:       o.State,
+		ProjectID:   o.ProjectID,
+		CallerData:  o.CallerData,
+	}
 }

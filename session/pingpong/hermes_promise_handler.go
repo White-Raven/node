@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/mysteriumnetwork/node/config"
@@ -53,7 +54,7 @@ type HermesHTTPRequester interface {
 	RequestPromise(rp RequestPromise) (crypto.Promise, error)
 	RevealR(r string, provider string, agreementID *big.Int) error
 	UpdatePromiseFee(promise crypto.Promise, newFee *big.Int) (crypto.Promise, error)
-	GetConsumerData(chainID int64, id string) (HermesUserInfo, error)
+	GetConsumerData(chainID int64, id string, cacheTime time.Duration) (HermesUserInfo, error)
 	GetProviderData(chainID int64, id string) (HermesUserInfo, error)
 	SyncProviderPromise(promise crypto.Promise, signer identity.Signer) error
 }
@@ -75,6 +76,7 @@ type HermesPromiseHandlerDeps struct {
 	HermesURLGetter      hermesURLGetter
 	HermesCallerFactory  HermesCallerFactory
 	Signer               identity.SignerFactory
+	Chains               []int64
 }
 
 // HermesPromiseHandler handles the hermes promises for ongoing sessions.
@@ -89,6 +91,10 @@ type HermesPromiseHandler struct {
 
 // NewHermesPromiseHandler returns a new instance of hermes promise handler.
 func NewHermesPromiseHandler(deps HermesPromiseHandlerDeps) *HermesPromiseHandler {
+	if len(deps.Chains) == 0 {
+		deps.Chains = []int64{config.GetInt64(config.FlagChain1ChainID), config.GetInt64(config.FlagChain2ChainID)}
+	}
+
 	return &HermesPromiseHandler{
 		deps:           deps,
 		queue:          make(chan enqueuedRequest, 100),
@@ -194,16 +200,31 @@ func (aph *HermesPromiseHandler) PayAndSettle(r []byte, em crypto.ExchangeMessag
 	return er.errChan
 }
 
-func (aph *HermesPromiseHandler) updateFees() {
-	chains := []int64{config.GetInt64(config.FlagChain1ChainID), config.GetInt64(config.FlagChain2ChainID)}
-	for _, v := range chains {
-		fees, err := aph.deps.FeeProvider.FetchSettleFees(v)
-		if err != nil {
-			log.Warn().Err(err).Msg("could not fetch fees, ignoring")
-			continue
-		}
-		aph.transactorFees[v] = fees
+func (aph *HermesPromiseHandler) getFees(chainID int64) (*big.Int, error) {
+	fee, ok := aph.transactorFees[chainID]
+	if ok && fee.IsValid() {
+		return fee.Fee, nil
 	}
+
+	if err := aph.updateFees(chainID); err != nil {
+		return nil, err
+	}
+
+	if updatedFee, ok := aph.transactorFees[chainID]; ok {
+		return updatedFee.Fee, nil
+	}
+
+	return nil, errors.New("failed to fetch fees")
+}
+
+func (aph *HermesPromiseHandler) updateFees(chainID int64) error {
+	fees, err := aph.deps.FeeProvider.FetchSettleFees(chainID)
+	if err != nil {
+		return err
+	}
+
+	aph.transactorFees[chainID] = fees
+	return nil
 }
 
 func (aph *HermesPromiseHandler) handleRequests() {
@@ -243,7 +264,12 @@ func (aph *HermesPromiseHandler) handleNodeEvents(e event.Payload) {
 	if e.Status == event.StatusStarted {
 		aph.startOnce.Do(
 			func() {
-				aph.updateFees()
+				for _, c := range aph.deps.Chains {
+					if err := aph.updateFees(c); err != nil {
+						log.Warn().Err(err).Msg("could not fetch fees")
+					}
+				}
+
 				aph.handleRequests()
 			},
 		)
@@ -256,14 +282,10 @@ func (aph *HermesPromiseHandler) requestPromise(er enqueuedRequest) {
 
 	providerID := er.providerID
 	hermesID := common.HexToAddress(er.em.HermesID)
-	fee, ok := aph.transactorFees[er.em.ChainID]
-	if !ok {
-		er.errChan <- fmt.Errorf("no fees for chain %v", er.em.ChainID)
+	fee, err := aph.getFees(er.em.ChainID)
+	if err != nil {
+		er.errChan <- fmt.Errorf("no fees for chain %v: %w", er.em.ChainID, err)
 		return
-	}
-
-	if !fee.IsValid() {
-		aph.updateFees()
 	}
 
 	details := rRecoveryDetails{
@@ -285,19 +307,24 @@ func (aph *HermesPromiseHandler) requestPromise(er enqueuedRequest) {
 
 	request := RequestPromise{
 		ExchangeMessage: er.em,
-		TransactorFee:   fee.Fee,
+		TransactorFee:   fee,
 		RRecoveryData:   hex.EncodeToString(encrypted),
 	}
 
 	promise, err := er.requestFunc(request)
 	err = aph.handleHermesError(err, providerID, er.em.ChainID, hermesID)
 	if err != nil {
-		if errors.Is(err, errRrecovered) {
-			log.Info().Msgf("r recovered")
+		if !errors.Is(err, errRrecovered) {
+			er.errChan <- fmt.Errorf("hermes request promise error: %w", err)
 			return
 		}
-		er.errChan <- fmt.Errorf("hermes request promise error: %w", err)
-		return
+		log.Info().Msgf("r recovered, will request again")
+
+		promise, err = er.requestFunc(request)
+		if err != nil {
+			er.errChan <- fmt.Errorf("attempted to request promise again and got an error: %w", err)
+			return
+		}
 	}
 
 	if promise.ChainID != request.ExchangeMessage.ChainID {

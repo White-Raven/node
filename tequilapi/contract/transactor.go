@@ -18,27 +18,65 @@
 package contract
 
 import (
+	"fmt"
 	"math/big"
 	"net/http"
 	"time"
 
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/core/beneficiary"
+	"github.com/mysteriumnetwork/node/identity/registry"
+	"github.com/mysteriumnetwork/payments/crypto"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/go-openapi/strfmt"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/session/pingpong"
 	"github.com/mysteriumnetwork/node/tequilapi/utils"
-	"github.com/mysteriumnetwork/node/tequilapi/validation"
 )
 
 // FeesDTO represents the transactor fees
 // swagger:model FeesDTO
 type FeesDTO struct {
-	Registration  *big.Int `json:"registration"`
-	Settlement    *big.Int `json:"settlement"`
-	Hermes        uint16   `json:"hermes"`
-	DecreaseStake *big.Int `json:"decreaseStake"`
+	Registration       *big.Int `json:"registration"`
+	RegistrationTokens Tokens   `json:"registration_tokens"`
+	Settlement         *big.Int `json:"settlement"`
+	SettlementTokens   Tokens   `json:"settlement_tokens"`
+	// deprecated - confusing name
+	Hermes              uint16   `json:"hermes"`
+	HermesPercent       string   `json:"hermes_percent"`
+	DecreaseStake       *big.Int `json:"decreaseStake"`
+	DecreaseStakeTokens Tokens   `json:"decrease_stake_tokens"`
+}
+
+// CombinedFeesResponse represents transactor fees.
+// swagger:model CombinedFeesResponse
+type CombinedFeesResponse struct {
+	Current TransactorFees `json:"current"`
+	Last    TransactorFees `json:"last"`
+
+	ServerTime    time.Time `json:"server_time"`
+	HermesPercent string    `json:"hermes_percent"`
+}
+
+// TransactorFees represents transactor fees.
+// swagger:model TransactorFees
+type TransactorFees struct {
+	Registration  Tokens `json:"registration"`
+	Settlement    Tokens `json:"settlement"`
+	DecreaseStake Tokens `json:"decrease_stake"`
+
+	ValidUntil time.Time `json:"valid_until"`
+}
+
+// NewTransactorFees converts registry fees to public api.
+func NewTransactorFees(r *registry.Fees) TransactorFees {
+	return TransactorFees{
+		Registration:  NewTokens(r.Register),
+		Settlement:    NewTokens(r.Settle),
+		DecreaseStake: NewTokens(r.DecreaseStake),
+		ValidUntil:    r.ValidUntil,
+	}
 }
 
 // NewSettlementListQuery creates settlement list query with default values.
@@ -75,21 +113,25 @@ type SettlementListQuery struct {
 }
 
 // Bind creates and validates query from API request.
-func (q *SettlementListQuery) Bind(request *http.Request) *validation.FieldErrorMap {
-	errs := validation.NewErrorMap()
-	errs.Set(q.PaginationQuery.Bind(request))
+func (q *SettlementListQuery) Bind(request *http.Request) *apierror.APIError {
+	v := apierror.NewValidator()
+	if err := q.PaginationQuery.Bind(request); err != nil {
+		for field, fieldErr := range err.Err.Fields {
+			v.Fail(field, fieldErr.Code, fieldErr.Message)
+		}
+	}
 
 	qs := request.URL.Query()
 	if qStr := qs.Get("date_from"); qStr != "" {
 		if qVal, err := parseDate(qStr); err != nil {
-			errs.ForField("date_from").Add(err)
+			v.Invalid("date_from", "Could not parse 'date_from'")
 		} else {
 			q.DateFrom = qVal
 		}
 	}
 	if qStr := qs.Get("date_to"); qStr != "" {
 		if qVal, err := parseDate(qStr); err != nil {
-			errs.ForField("date_to").Add(err)
+			v.Invalid("date_to", "Could not parse 'date_to'")
 		} else {
 			q.DateTo = qVal
 		}
@@ -102,12 +144,10 @@ func (q *SettlementListQuery) Bind(request *http.Request) *validation.FieldError
 	}
 
 	if types, ok := qs["types"]; ok {
-		for _, sv := range types {
-			q.Types = append(q.Types, sv)
-		}
+		q.Types = append(q.Types, types...)
 	}
 
-	return errs
+	return v.Err()
 }
 
 // ToFilter converts API query to storage filter.
@@ -220,8 +260,11 @@ type SettlementDTO struct {
 // SettleRequest represents the request to settle hermes promises
 // swagger:model SettleRequestDTO
 type SettleRequest struct {
-	HermesID   string `json:"hermes_id"`
-	ProviderID string `json:"provider_id"`
+	HermesIDs  []common.Address `json:"hermes_ids"`
+	ProviderID string           `json:"provider_id"`
+
+	// Deprecated
+	HermesID string `json:"hermes_id"`
 }
 
 // WithdrawRequest represents the request to withdraw earnings to l1.
@@ -235,9 +278,50 @@ type WithdrawRequest struct {
 	Amount      string `json:"amount,omitempty"`
 }
 
+// Validate will validate a given request
+func (w *WithdrawRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
+	zeroAddr := common.HexToAddress("").Hex()
+	if !common.IsHexAddress(w.HermesID) || w.HermesID == zeroAddr {
+		v.Invalid("hermes_id", "'hermes_id' should be a valid hex address")
+	}
+	if !common.IsHexAddress(w.ProviderID) || w.ProviderID == zeroAddr {
+		v.Invalid("provider_id", "'provider_id' should be a valid hex address")
+	}
+	if !common.IsHexAddress(w.Beneficiary) || w.Beneficiary == zeroAddr {
+		v.Invalid("beneficiary", "'beneficiary' should be a valid hex address")
+	}
+
+	amount, err := w.AmountInMYST()
+	if err != nil {
+		v.Invalid("amount", err.Error())
+	} else if amount != nil && amount.Cmp(crypto.FloatToBigMyst(99)) > 0 {
+		v.Invalid("amount", "withdrawal amount cannot be more than 99 MYST")
+	}
+
+	return v.Err()
+}
+
+// AmountInMYST will return the amount value converted to big.Int MYST.
+//
+// Amount can be `nil`
+func (w *WithdrawRequest) AmountInMYST() (*big.Int, error) {
+	if w.Amount == "" {
+		return nil, nil
+	}
+
+	res, ok := big.NewInt(0).SetString(w.Amount, 10)
+	if !ok {
+		return nil, fmt.Errorf("%v is not a valid integer", w.Amount)
+	}
+
+	return res, nil
+}
+
 // SettleWithBeneficiaryRequest represent the request to settle with new beneficiary address.
 type SettleWithBeneficiaryRequest struct {
-	SettleRequest
+	ProviderID  string `json:"provider_id"`
+	HermesID    string `json:"hermes_id"`
 	Beneficiary string `json:"beneficiary"`
 }
 

@@ -27,5 +27,6 @@ import (
 
 // Zero install option.
 // Usage example:
-//   go run mage.go test
+//
+//	go run mage.go test
 func main() { os.Exit(mage.Main()) }

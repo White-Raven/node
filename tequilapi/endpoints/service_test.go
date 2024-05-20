@@ -27,8 +27,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gin-gonic/gin"
-
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/core/service"
 	"github.com/mysteriumnetwork/node/core/service/servicestate"
 	"github.com/mysteriumnetwork/node/identity"
@@ -101,10 +100,13 @@ func (sm *mockServiceManager) Service(id service.ID) *service.Instance {
 	}
 	return nil
 }
-func (sm *mockServiceManager) List() map[service.ID]*service.Instance {
-	return map[service.ID]*service.Instance{
-		"11111111-9dad-11d1-80b4-00c04fd430c0": mockServiceStopped,
+func (sm *mockServiceManager) List(includeAll bool) []*service.Instance {
+	return []*service.Instance{
+		mockServiceStopped,
 	}
+}
+func (sm *mockServiceManager) ListAll() []*service.Instance {
+	return []*service.Instance{mockServiceStopped}
 }
 func (sm *mockServiceManager) Kill() error { return nil }
 
@@ -120,14 +122,20 @@ var fakeOptionsParser = map[string]services.ServiceOptionsParser{
 	},
 }
 
+type mockTequilaApiClient struct{}
+
+func (c *mockTequilaApiClient) Post(path string, payload interface{}) (*http.Response, error) {
+	return nil, nil
+}
+
 func Test_AddRoutesForServiceAddsRoutes(t *testing.T) {
-	router := gin.Default()
+	router := summonTestGin()
 	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{
 		priceToAdd: market.Price{
-			PricePerHour: big.NewInt(1),
-			PricePerGiB:  big.NewInt(2),
+			PricePerHour: big.NewInt(500_000_000_000_000_000),
+			PricePerGiB:  big.NewInt(1_000_000_000_000_000_000),
 		},
-	})(router)
+	}, nil)(router)
 	assert.NoError(t, err)
 	tests := []struct {
 		method         string
@@ -142,38 +150,15 @@ func Test_AddRoutesForServiceAddsRoutes(t *testing.T) {
 			"",
 			http.StatusOK,
 			`[{
-				"id": "11111111-9dad-11d1-80b4-00c04fd430c0",
+				"options": {"foo": "bar"},
 				"provider_id": "0xproviderid",
 				"type": "testprotocol",
-				"options": {"foo": "bar"},
-				"status": "NotRunning",
-				"proposal": {
-                    "format": "service-proposal/v3",
-                    "compatibility": 1,
-					"provider_id": "0xproviderid",
-					"service_type": "testprotocol",
-					"location": {
-						"asn": 123,
-						"country": "Lithuania",
-						"city": "Vilnius"
-					},
-                    "quality": {
-                      "quality": 2.0,
-                      "latency": 50,
-                      "bandwidth": 10
-                    },
-					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
-					}
-				},
-				"connection_statistics": {"attempted":0, "successful":0}
+				"status": "NotRunning"
 			}]`,
 		},
 		{
 			http.MethodPost,
-			"/services",
+			"/services?ignore_user_config=true",
 			`{"provider_id": "node1", "type": "testprotocol"}`,
 			http.StatusCreated,
 			`{
@@ -184,7 +169,7 @@ func Test_AddRoutesForServiceAddsRoutes(t *testing.T) {
 				"status": "Running",
 				"proposal": {
 		            "format": "service-proposal/v3",
-		            "compatibility": 1,
+		            "compatibility": 2,
 					"provider_id": "0xproviderid",
 					"service_type": "testprotocol",
 					"location": {
@@ -195,15 +180,25 @@ func Test_AddRoutesForServiceAddsRoutes(t *testing.T) {
 		            "quality": {
 		              "quality": 2.0,
 		              "latency": 50,
-		              "bandwidth": 10
+		              "bandwidth": 10,
+		              "uptime": 20
 		            },
 					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
+					  "currency": "MYST",
+					  "per_gib": 1000000000000000000,
+					  "per_gib_tokens": {
+						"ether": "1",
+						"human": "1",
+						"wei": "1000000000000000000"
+					  },
+					  "per_hour": 500000000000000000,
+					  "per_hour_tokens": {
+						"ether": "0.5",
+						"human": "0.5",
+						"wei": "500000000000000000"
+					  }
 					}
-				},
-				"connection_statistics": {"attempted":0, "successful":0}
+				}
 			}`,
 		},
 		{
@@ -219,7 +214,7 @@ func Test_AddRoutesForServiceAddsRoutes(t *testing.T) {
 				"status": "Running",
 				"proposal": {
 		            "format": "service-proposal/v3",
-		            "compatibility": 1,
+		            "compatibility": 2,
 					"provider_id": "0xproviderid",
 					"service_type": "testprotocol",
 					"location": {
@@ -230,24 +225,34 @@ func Test_AddRoutesForServiceAddsRoutes(t *testing.T) {
 		            "quality": {
 		              "quality": 2.0,
 		              "latency": 50,
-		              "bandwidth": 10
+		              "bandwidth": 10,
+		              "uptime": 20
 		            },
 					"price": {
-						"currency": "MYST",
-						"per_gib": 2.0,
-						"per_hour": 1.0
+					  "currency": "MYST",
+					  "per_gib": 1000000000000000000,
+					  "per_gib_tokens": {
+						"ether": "1",
+						"human": "1",
+						"wei": "1000000000000000000"
+					  },
+					  "per_hour": 500000000000000000,
+					  "per_hour_tokens": {
+						"ether": "0.5",
+						"human": "0.5",
+						"wei": "500000000000000000"
+					  }
 					}
-				},
-				"connection_statistics": {"attempted":0, "successful":0}
+				}
 			}`,
 		},
 		{
-			http.MethodDelete, "/services/6ba7b810-9dad-11d1-80b4-00c04fd430c8", "",
+			http.MethodDelete, "/services/6ba7b810-9dad-11d1-80b4-00c04fd430c8?ignore_user_config=true", "",
 			http.StatusAccepted, "",
 		},
 		{
 			http.MethodDelete, "/services/00000000-9dad-11d1-80b4-00c04fd43000", "",
-			http.StatusNotFound, `{"message":"Service not found"}`,
+			http.StatusNotFound, `{ "error": {"code":"not_found", "message":"Service not found"}, "path":"/services/00000000-9dad-11d1-80b4-00c04fd43000", "status":404 }`,
 		},
 	}
 
@@ -278,23 +283,17 @@ func Test_ServiceStartInvalidType(t *testing.T) {
 	)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message": "validation_error",
-			"errors": {
-				"type": [ {"code": "invalid", "message": "Invalid service type"} ]
-			}
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	apiErr := apierror.Parse(resp.Result())
+	assert.Equal(t, "validation_failed", apiErr.Err.Code)
+	assert.Contains(t, apiErr.Err.Fields, "type")
+	assert.Equal(t, "invalid_value", apiErr.Err.Fields["type"].Code)
 }
 
 func Test_ServiceStart_InvalidType(t *testing.T) {
@@ -309,23 +308,17 @@ func Test_ServiceStart_InvalidType(t *testing.T) {
 	)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message": "validation_error",
-			"errors": {
-				"type": [ {"code": "invalid", "message": "Invalid service type"} ]
-			}
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	apiErr := apierror.Parse(resp.Result())
+	assert.Equal(t, "validation_failed", apiErr.Err.Code)
+	assert.Contains(t, apiErr.Err.Fields, "type")
+	assert.Equal(t, "invalid_value", apiErr.Err.Fields["type"].Code)
 }
 
 func Test_ServiceStart_InvalidOptions(t *testing.T) {
@@ -340,23 +333,17 @@ func Test_ServiceStart_InvalidOptions(t *testing.T) {
 	)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message": "validation_error",
-			"errors": {
-				"options": [ {"code": "invalid", "message": "Invalid options" } ]
-			}
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	apiErr := apierror.Parse(resp.Result())
+	assert.Equal(t, "validation_failed", apiErr.Err.Code)
+	assert.Contains(t, apiErr.Err.Fields, "options")
+	assert.Equal(t, "invalid_value", apiErr.Err.Fields["options"].Code)
 }
 
 func Test_ServiceStartAlreadyRunning(t *testing.T) {
@@ -371,26 +358,22 @@ func Test_ServiceStartAlreadyRunning(t *testing.T) {
 	)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusConflict, resp.Code)
-	assert.JSONEq(
-		t,
-		`{"message":"Service already running"}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
+	assert.Equal(t, "err_service_running", apierror.Parse(resp.Result()).Err.Code)
 }
 
 func Test_ServiceStatus_NotFoundIsReturnedWhenNotStarted(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/services/1", nil)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
@@ -402,16 +385,17 @@ func Test_ServiceGetReturnsServiceInfo(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/services/6ba7b810-9dad-11d1-80b4-00c04fd430c8", nil)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForService(
 		&mockServiceManager{},
 		fakeOptionsParser,
 		&mockProposalRepository{
 			priceToAdd: market.Price{
-				PricePerHour: big.NewInt(1),
-				PricePerGiB:  big.NewInt(2),
+				PricePerHour: big.NewInt(500_000_000_000_000_000),
+				PricePerGiB:  big.NewInt(1_000_000_000_000_000_000),
 			},
 		},
+		nil,
 	)(g)
 	assert.NoError(t, err)
 
@@ -428,7 +412,7 @@ func Test_ServiceGetReturnsServiceInfo(t *testing.T) {
 			"status": "Running",
 			"proposal": {
 				"format": "service-proposal/v3",
-				"compatibility": 1,
+				"compatibility": 2,
 				"provider_id": "0xproviderid",
 				"service_type": "testprotocol",
 				"location": {
@@ -439,15 +423,25 @@ func Test_ServiceGetReturnsServiceInfo(t *testing.T) {
 				"quality": {
 				  "quality": 2.0,
 				  "latency": 50,
-				  "bandwidth": 10
+				  "bandwidth": 10,
+				  "uptime": 20
 				},
 				"price": {
-					"currency": "MYST",
-					"per_gib": 2.0,
-					"per_hour": 1.0
-				}
-			},
-			"connection_statistics": {"attempted":0, "successful":0}
+                  "currency": "MYST",
+                  "per_gib": 1000000000000000000,
+                  "per_gib_tokens": {
+                    "ether": "1",
+                    "human": "1",
+                    "wei": "1000000000000000000"
+                  },
+                  "per_hour": 500000000000000000,
+                  "per_hour_tokens": {
+                    "ether": "0.5",
+                    "human": "0.5",
+                    "wei": "500000000000000000"
+                  }
+                }
+			}
 		}`,
 		resp.Body.String(),
 	)
@@ -456,49 +450,39 @@ func Test_ServiceCreate_Returns400ErrorIfRequestBodyIsNotJSON(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/services", strings.NewReader("a"))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusBadRequest, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message": "invalid character 'a' looking for beginning of value"
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, "parse_failed", apierror.Parse(resp.Result()).Err.Code)
 }
 
 func Test_ServiceCreate_Returns422ErrorIfRequestBodyIsMissingFieldValues(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/services", strings.NewReader("{}"))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
-	assert.JSONEq(t,
-		`{
-			"message": "validation_error",
-			"errors": {
-				"provider_id": [ {"code": "required", "message": "Field is required"} ],
-				"type": [ {"code": "required", "message": "Field is required"} ]
-			}
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	apiErr := apierror.Parse(resp.Result())
+	assert.Equal(t, "validation_failed", apiErr.Err.Code)
+	assert.Contains(t, apiErr.Err.Fields, "provider_id")
+	assert.Equal(t, "required", apiErr.Err.Fields["provider_id"].Code)
+	assert.Contains(t, apiErr.Err.Fields, "type")
+	assert.Equal(t, "required", apiErr.Err.Fields["type"].Code)
 }
 
 func Test_ServiceStart_WithAccessPolicy(t *testing.T) {
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/services",
+		"/services?ignore_user_config=true",
 		strings.NewReader(`{
 			"type": "mockAccessPolicyService",
 			"provider_id": "0x9edf75f870d87d2d1a69f0d950a99984ae955ee0",
@@ -509,13 +493,13 @@ func Test_ServiceStart_WithAccessPolicy(t *testing.T) {
 	)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{
 		priceToAdd: market.Price{
-			PricePerHour: big.NewInt(1),
-			PricePerGiB:  big.NewInt(2),
+			PricePerHour: big.NewInt(500_000_000_000_000_000),
+			PricePerGiB:  big.NewInt(1_000_000_000_000_000_000),
 		},
-	})(g)
+	}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
@@ -531,7 +515,7 @@ func Test_ServiceStart_WithAccessPolicy(t *testing.T) {
 			"status": "Running",
 			"proposal": {
 				"format": "service-proposal/v3",
-				"compatibility": 1,
+				"compatibility": 2,
 				"provider_id": "0xproviderid",
 				"service_type": "mockAccessPolicyService",
 				"location": {
@@ -542,13 +526,24 @@ func Test_ServiceStart_WithAccessPolicy(t *testing.T) {
 				"quality": {
 				  "quality": 2.0,
 				  "latency": 50,
-				  "bandwidth": 10
+				  "bandwidth": 10,
+				  "uptime": 20
 				},
 				"price": {
-					"currency": "MYST",
-					"per_gib": 2.0,
-					"per_hour": 1.0
-				},
+                  "currency": "MYST",
+                  "per_gib": 1000000000000000000,
+                  "per_gib_tokens": {
+                    "ether": "1",
+                    "human": "1",
+                    "wei": "1000000000000000000"
+                  },
+                  "per_hour": 500000000000000000,
+                  "per_hour_tokens": {
+                    "ether": "0.5",
+                    "human": "0.5",
+                    "wei": "500000000000000000"
+                  }
+                },
 				"access_policies": [
 					{
 						"id":"verified-traffic",
@@ -567,8 +562,7 @@ func Test_ServiceStart_WithAccessPolicy(t *testing.T) {
 						"source": "https://some.domain/api/v1/lists/12312312332132"
 					}
 				]
-			},
-			"connection_statistics": {"attempted":0, "successful":0}
+			}
 		}`,
 		resp.Body.String(),
 	)
@@ -588,16 +582,12 @@ func Test_ServiceStart_ReturnsBadRequest_WithUnknownParams(t *testing.T) {
 	)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
-	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{})(g)
+	g := summonTestGin()
+	err := AddRoutesForService(&mockServiceManager{}, fakeOptionsParser, &mockProposalRepository{}, nil)(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusBadRequest, resp.Code)
-	assert.JSONEq(
-		t,
-		`{"message": "json: unknown field \"access_policy\""}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, "parse_failed", apierror.Parse(resp.Result()).Err.Code)
 }

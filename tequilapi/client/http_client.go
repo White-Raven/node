@@ -22,12 +22,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/rs/zerolog/log"
 
 	"github.com/mysteriumnetwork/node/requests"
@@ -127,25 +126,10 @@ func (client *httpClient) executeRequest(method, fullPath string, payloadJSON []
 	return response, nil
 }
 
-type errorBody struct {
-	Message string `json:"message"`
-}
-
 func parseResponseError(response *http.Response) error {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		//sometimes we can get json message with single "message" field which represents error - try to get that
-		var parsedBody errorBody
-		var message string
-		err := parseResponseJSON(response, &parsedBody)
-		if err != nil {
-			message = err.Error()
-		} else {
-			message = parsedBody.Message
-		}
-		// TODO these errors are ugly long and hard to check against - consider return error structs or specific error constants
-		return errors.Errorf("server response invalid: %s (%s). Possible error: %s", response.Status, response.Request.URL, message)
+		return apierror.Parse(response)
 	}
-
 	return nil
 }
 
@@ -162,7 +146,7 @@ func parseResponseJSON(response *http.Response, dto interface{}) error {
 	// NopCloser returns a ReadCloser with a no-op Close method wrapping the provided Reader r.
 	// parseResponseError "empties" the contents of an errored response
 	// this way the response can be read and parsed again further down the line
-	response.Body = ioutil.NopCloser(b)
+	response.Body = io.NopCloser(b)
 
 	return nil
 }

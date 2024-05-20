@@ -23,14 +23,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/requests"
 	"github.com/mysteriumnetwork/payments/crypto"
@@ -99,6 +101,20 @@ type hermesError interface {
 type HermesCaller struct {
 	transport     *requests.HTTPClient
 	hermesBaseURI string
+	cache         hermesCallerCache
+}
+
+// hermesCallerCache represents the cache for call responses
+type hermesCallerCache struct {
+	data map[string]hermesCallerCacheData
+	lock sync.RWMutex
+}
+
+// hermesCallerCacheData represents the cache data
+type hermesCallerCacheData struct {
+	info      *HermesUserInfo
+	err       error
+	updatedAt time.Time
 }
 
 // NewHermesCaller returns a new instance of hermes caller.
@@ -106,6 +122,9 @@ func NewHermesCaller(transport *requests.HTTPClient, hermesBaseURI string) *Herm
 	return &HermesCaller{
 		transport:     transport,
 		hermesBaseURI: hermesBaseURI,
+		cache: hermesCallerCache{
+			data: make(map[string]hermesCallerCacheData),
+		},
 	}
 }
 
@@ -217,7 +236,7 @@ func (ac *HermesCaller) RevealR(r, provider string, agreementID *big.Int) error 
 
 // IsIdentityOffchain returns true if identity is considered offchain in hermes.
 func (ac *HermesCaller) IsIdentityOffchain(chainID int64, id string) (bool, error) {
-	data, err := ac.GetConsumerData(chainID, id)
+	data, err := ac.GetConsumerData(chainID, id, time.Second)
 	if err != nil {
 		if errors.Is(err, ErrHermesNotFound) {
 			return false, nil
@@ -253,7 +272,7 @@ func (ac *HermesCaller) SyncProviderPromise(promise crypto.Promise, signer ident
 		return fmt.Errorf("could not make promise sync request: %w", err)
 	}
 
-	err = ac.doRequest(req, map[string]interface{}{})
+	err = ac.doRequest(req, map[string]any{})
 	if err != nil {
 		return fmt.Errorf("could not sync promise hermes: %w", err)
 	}
@@ -261,8 +280,44 @@ func (ac *HermesCaller) SyncProviderPromise(promise crypto.Promise, signer ident
 	return nil
 }
 
-// GetConsumerData gets consumer data from hermes
-func (ac *HermesCaller) GetConsumerData(chainID int64, id string) (HermesUserInfo, error) {
+type refreshPromiseRequest struct {
+	ChainID       int64  `json:"chain_id"`
+	Identity      string `json:"identity"`
+	Hashlock      string `json:"hashlock"`
+	RRecoveryData string `json:"r_recovery_data"`
+}
+
+// RefreshLatestProviderPromise reissue latest promise with a new hashlock.
+func (ac *HermesCaller) RefreshLatestProviderPromise(chainID int64, id string, hashlock, recoveryData []byte, signer identity.Signer) (crypto.Promise, error) {
+	res := crypto.Promise{}
+	toSend := refreshPromiseRequest{
+		ChainID:       chainID,
+		Identity:      id,
+		Hashlock:      common.Bytes2Hex(hashlock),
+		RRecoveryData: common.Bytes2Hex(recoveryData),
+	}
+
+	req, err := requests.NewSignedPostRequest(ac.hermesBaseURI, "refresh_promise", toSend, signer)
+	if err != nil {
+		return res, fmt.Errorf("could not make promise sync request: %w", err)
+	}
+
+	err = ac.doRequest(req, &res)
+	if err != nil {
+		return res, fmt.Errorf("could not refresh promise: %w", err)
+	}
+
+	return res, nil
+}
+
+// GetConsumerData gets consumer data from hermes, use a negative cacheTime to force update
+func (ac *HermesCaller) GetConsumerData(chainID int64, id string, cacheTime time.Duration) (HermesUserInfo, error) {
+	if cacheTime > 0 {
+		cachedResponse, cachedError, ok := ac.getResponseFromCache(chainID, id, cacheTime)
+		if ok {
+			return cachedResponse, cachedError
+		}
+	}
 	req, err := requests.NewGetRequest(ac.hermesBaseURI, fmt.Sprintf("data/consumer/%v", id), nil)
 	if err != nil {
 		return HermesUserInfo{}, fmt.Errorf("could not form consumer data request: %w", err)
@@ -270,6 +325,10 @@ func (ac *HermesCaller) GetConsumerData(chainID int64, id string) (HermesUserInf
 	var resp map[int64]HermesUserInfo
 	err = ac.doRequest(req, &resp)
 	if err != nil {
+		if errors.Is(err, ErrHermesNotFound) {
+			// also save not found status
+			ac.setCacheData(chainID, id, nil, err)
+		}
 		return HermesUserInfo{}, fmt.Errorf("could not request consumer data from hermes: %w", err)
 	}
 
@@ -283,21 +342,25 @@ func (ac *HermesCaller) GetConsumerData(chainID int64, id string) (HermesUserInf
 		return HermesUserInfo{}, fmt.Errorf("could not check promise validity: %w", err)
 	}
 
+	ac.setCacheData(chainID, id, &data, nil)
+
 	return data, nil
+}
+
+func (ac *HermesCaller) setCacheData(chainID int64, id string, data *HermesUserInfo, err error) {
+	ac.cache.lock.Lock()
+	defer ac.cache.lock.Unlock()
+
+	ac.cache.data[getCacheKey(chainID, id)] = hermesCallerCacheData{
+		updatedAt: time.Now(),
+		info:      data,
+		err:       err,
+	}
 }
 
 // GetProviderData gets provider data from hermes
 func (ac *HermesCaller) GetProviderData(chainID int64, id string) (HermesUserInfo, error) {
-	data, err := ac.getProviderData(chainID, id)
-	if err != nil {
-		return HermesUserInfo{}, err
-	}
-	err = data.LatestPromise.isValid(id)
-	if err != nil {
-		return HermesUserInfo{}, fmt.Errorf("could not check promise validity: %w", err)
-	}
-
-	return data, nil
+	return ac.getProviderData(chainID, id)
 }
 
 // ProviderPromiseAmountUnsafe returns the provider promise amount.
@@ -334,13 +397,13 @@ func (ac *HermesCaller) getProviderData(chainID int64, id string) (HermesUserInf
 	return data, nil
 }
 
-func (ac *HermesCaller) doRequest(req *http.Request, to interface{}) error {
+func (ac *HermesCaller) doRequest(req *http.Request, to any) error {
 	resp, err := ac.transport.Do(req)
 	if err != nil {
 		return fmt.Errorf("could not execute request: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("could not read response body: %w", err)
 	}
@@ -356,12 +419,32 @@ func (ac *HermesCaller) doRequest(req *http.Request, to interface{}) error {
 
 	// parse error body
 	hermesError := HermesErrorResponse{}
+	if string(body) == "" {
+		hermesError.ErrorMessage = "Unknown error"
+		return hermesError
+	}
+
 	err = json.Unmarshal(body, &hermesError)
 	if err != nil {
 		return fmt.Errorf("could not unmarshal error body: %w", err)
 	}
 
 	return hermesError
+}
+
+func (ac *HermesCaller) getResponseFromCache(chainID int64, identity string, cacheDuration time.Duration) (HermesUserInfo, error, bool) {
+	ac.cache.lock.RLock()
+	defer ac.cache.lock.RUnlock()
+
+	cacheKey := getCacheKey(chainID, identity)
+	cachedResponse, ok := ac.cache.data[cacheKey]
+	if ok && cachedResponse.updatedAt.Add(cacheDuration).After(time.Now()) {
+		if cachedResponse.err != nil {
+			return HermesUserInfo{}, cachedResponse.err, true
+		}
+		return *cachedResponse.info, nil, true
+	}
+	return HermesUserInfo{}, nil, false
 }
 
 // HermesUserInfo represents the consumer data
@@ -446,6 +529,10 @@ func (lp LatestPromise) isValid(id string) error {
 	}
 
 	return nil
+}
+
+func getCacheKey(chainID int64, identity string) string {
+	return fmt.Sprintf("%d:%s", chainID, strings.ToLower(identity))
 }
 
 // RevealSuccess represents the reveal success response from hermes

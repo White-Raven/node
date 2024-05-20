@@ -42,6 +42,7 @@ func Test_ServiceProposal_Serialize(t *testing.T) {
 			Quality:   2.0,
 			Latency:   5,
 			Bandwidth: 100,
+			Uptime:    20,
 		},
 		Contacts: ContactList{},
 	})
@@ -50,7 +51,7 @@ func Test_ServiceProposal_Serialize(t *testing.T) {
 	assert.Nil(t, err)
 
 	expectedJSON := `{
-      "compatibility": 1,
+      "compatibility": 2,
 	  "format": "service-proposal/v3",
 	  "service_type": "mock_service",
 	  "provider_id": "node",
@@ -59,7 +60,8 @@ func Test_ServiceProposal_Serialize(t *testing.T) {
       "quality": {
         "quality": 2.0,
         "latency": 5,
-        "bandwidth": 100
+        "bandwidth": 100,
+        "uptime": 20
       },
       "contacts": []
 	}`

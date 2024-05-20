@@ -18,7 +18,7 @@
 package contract
 
 import (
-	"github.com/mysteriumnetwork/node/tequilapi/validation"
+	"github.com/mysteriumnetwork/go-rest/apierror"
 )
 
 // MMNApiKeyRequest request used to manage MMN's API key.
@@ -28,13 +28,26 @@ type MMNApiKeyRequest struct {
 }
 
 // Validate validates fields in request
-func (r MMNApiKeyRequest) Validate() *validation.FieldErrorMap {
-	errs := validation.NewErrorMap()
+func (r MMNApiKeyRequest) Validate() *apierror.APIError {
+	v := apierror.NewValidator()
 	if len(r.ApiKey) == 0 {
-		errs.ForField("api_key").Required()
+		v.Required("api_key")
+	} else if len(r.ApiKey) < 40 {
+		v.Invalid("api_key", "Should be at least 40 characters long")
 	}
-	if len(r.ApiKey) < 40 {
-		errs.ForField("api_key").Invalid("Invalid API key")
-	}
-	return errs
+	return v.Err()
+}
+
+// MMNLinkRedirectResponse claim link response
+// swagger:model MMNLinkRedirectResponse
+type MMNLinkRedirectResponse struct {
+	Link string `json:"link"`
+}
+
+// MMNGrantVerificationResponse message received via redirect from mystnodes.com
+// swagger:model MMNGrantVerificationResponse
+type MMNGrantVerificationResponse struct {
+	ApiKey                        string `json:"api_key"`
+	WalletAddress                 string `json:"wallet_address"`
+	IsEligibleForFreeRegistration bool   `json:"is_eligible_for_free_registration"`
 }

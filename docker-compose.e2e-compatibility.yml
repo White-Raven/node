@@ -58,7 +58,7 @@ services:
       retries: 5
 
   discovery:
-    image: mysteriumnetwork/discovery:2.2.0
+    image: mysteriumnetwork/discovery:2.18.3
     depends_on:
       - db
       - http-mock
@@ -102,7 +102,7 @@ services:
       -settlemntFee 1000
       -topUpAmount 7000000000000000000
       -stakeDecreaseFee 1
-      -mystSCAddress 0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665
+      -mystSCAddress 0xaa9c4e723609cb913430143fbc86d3cbe7adca21
       -rpcEndpoint http://ganache:8545
       -registry 0xbe180c8CA53F280C7BE8669596fF7939d933AA10
       -ourIdentity 0x354bd098b4ef8c9e70b7f21be2d455df559705d7
@@ -127,13 +127,13 @@ services:
       - mongodb
     command: >
       -identityPassphrase ""
-      -myst 0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665
+      -myst 0xaa9c4e723609cb913430143fbc86d3cbe7adca21
       -rpcEndpoint http://ganache:8545
       -registry 0xbe180c8CA53F280C7BE8669596fF7939d933AA10
       -operator 0x354bd098b4ef8c9e70b7f21be2d455df559705d7
       -chImplementation 0x599d43715DF3070f83355D9D90AE62c159E62A75
       -keystoreDir /keystore
-      -hermesAddress 0x241F6e1d0bB17f45767DC60A6Bd3D21Cdb543a0c
+      -hermesAddress 0x427c2bad22335710aec5e477f3e3adcd313a9bcb
       -bcDataRefreshInterval 1ns
       -MongoUser hermes
       -MongoPass hermes
@@ -182,14 +182,14 @@ services:
     command: >
       --discovery.ping=1s
       --discovery.fetch=1s
-      --payments.mystscaddress=0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665
+      --payments.mystscaddress=0xaa9c4e723609cb913430143fbc86d3cbe7adca21
       --ip-detector=http://ipify:3000/?format=json
       --location.type=manual
       --location.country=e2e-land
       --firewall.protected.networks=""
       --broker-address=broker
       --tequilapi.address=0.0.0.0
-      --api.address=http://discovery:8080/api/v3
+      --discovery.address=http://discovery:8080/api/v4
       --ether.client.rpc=http://ganache:8545
       --transactor.registry-address=0xbe180c8CA53F280C7BE8669596fF7939d933AA10
       --transactor.channel-implementation=0x599d43715DF3070f83355D9D90AE62c159E62A75
@@ -197,7 +197,7 @@ services:
       --transactor.address=http://transactor:8888/api/v1
       --keystore.lightweight
       --log-level=debug
-      --quality.address=http://morqa:8085/api/v2
+      --quality.address=http://morqa:8085/api/v3
       --payments.provider.invoice-frequency=1s
       --stun-servers=""
       service
@@ -205,7 +205,7 @@ services:
       --identity=0xd1a23227bd5ad77f36ba62badcb78a410a1db6c5
       --identity.passphrase=localprovider
       --openvpn.port=3000
-      openvpn,noop,wireguard
+      --active-services=openvpn,noop,wireguard
 
   myst-consumer:
     image: mysteriumnetwork/myst:0.19.1-alpine
@@ -226,7 +226,7 @@ services:
     command: >
       --discovery.ping=1s
       --discovery.fetch=1s
-      --payments.mystscaddress=0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665
+      --payments.mystscaddress=0xaa9c4e723609cb913430143fbc86d3cbe7adca21
       --transactor.registry-address=0xbe180c8CA53F280C7BE8669596fF7939d933AA10
       --hermes.hermes-id=0xf2e2c77D2e7207d8341106E6EfA469d1940FD0d8
       --transactor.address=http://transactor:8888/api/v1
@@ -236,11 +236,11 @@ services:
       --log-level=debug
       --broker-address=broker
       --tequilapi.address=0.0.0.0
-      --api.address=http://discovery:8080/api/v3
+      --discovery.address=http://discovery:8080/api/v4
       --ether.client.rpc=http://ganache:8545
       --keystore.lightweight
       --firewall.killSwitch.always
-      --quality.address=http://morqa:8085/api/v2
+      --quality.address=http://morqa:8085/api/v3
       --stun-servers=""
       daemon
 
@@ -267,13 +267,13 @@ services:
     command: >
       --discovery.ping=1s
       --discovery.fetch=1s
-      --payments.mystscaddress=0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665
+      --payments.mystscaddress=0xaa9c4e723609cb913430143fbc86d3cbe7adca21
       --ip-detector=http://ipify:3000/?format=json
       --location.type=manual
       --location.country=e2e-land
       --firewall.protected.networks=""
       --broker-address=broker
-      --api.address=http://discovery:8080/api/v3
+      --discovery.address=http://discovery:8080/api/v4
       --ether.client.rpc=http://ganache:8545
       --transactor.registry-address=0xbe180c8CA53F280C7BE8669596fF7939d933AA10
       --transactor.channel-implementation=0x599d43715DF3070f83355D9D90AE62c159E62A75
@@ -281,14 +281,14 @@ services:
       --transactor.address=http://transactor:8888/api/v1
       --keystore.lightweight
       --log-level=debug
-      --quality.address=http://morqa:8085/api/v2
+      --quality.address=http://morqa:8085/api/v3
       --stun-servers=""
       service
       --agreed-terms-and-conditions
       --identity=0xd1a23227bd5ad77f36ba62badcb78a410a1db6c5
       --identity.passphrase=localprovider
       --openvpn.port=3000
-      openvpn,noop,wireguard
+      --active-services=openvpn,noop,wireguard
 
   myst-consumer-local:
     build:
@@ -311,7 +311,7 @@ services:
     command: >
       --discovery.ping=1s
       --discovery.fetch=1s
-      --payments.mystscaddress=0x4D1d104AbD4F4351a0c51bE1e9CA0750BbCa1665
+      --payments.mystscaddress=0xaa9c4e723609cb913430143fbc86d3cbe7adca21
       --transactor.registry-address=0xbe180c8CA53F280C7BE8669596fF7939d933AA10
       --hermes.hermes-id=0xf2e2c77D2e7207d8341106E6EfA469d1940FD0d8
       --transactor.address=http://transactor:8888/api/v1
@@ -320,11 +320,11 @@ services:
       --location.type=manual
       --log-level=debug
       --broker-address=broker
-      --api.address=http://discovery:8080/api/v3
+      --discovery.address=http://discovery:8080/api/v4
       --ether.client.rpc=http://ganache:8545
       --keystore.lightweight
       --firewall.killSwitch.always
-      --quality.address=http://morqa:8085/api/v2
+      --quality.address=http://morqa:8085/api/v3
       --stun-servers=""
       --local-service-discovery=true
       daemon

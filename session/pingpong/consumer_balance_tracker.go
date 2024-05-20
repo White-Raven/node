@@ -28,6 +28,8 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mysteriumnetwork/node/config"
 	nodevent "github.com/mysteriumnetwork/node/core/node/event"
 	"github.com/mysteriumnetwork/node/eventbus"
@@ -37,7 +39,6 @@ import (
 	"github.com/mysteriumnetwork/node/session/pingpong/event"
 	"github.com/mysteriumnetwork/payments/client"
 	"github.com/mysteriumnetwork/payments/units"
-	"github.com/rs/zerolog/log"
 )
 
 type balanceKey string
@@ -69,6 +70,7 @@ type ConsumerBalanceTracker struct {
 	consumerGrandTotalsStorage           consumerTotalsStorage
 	consumerInfoGetter                   consumerInfoGetter
 	transactorRegistrationStatusProvider transactorRegistrationStatusProvider
+	blockchainInfoProvider               blockchainInfoProvider
 	stop                                 chan struct{}
 	once                                 sync.Once
 
@@ -82,6 +84,10 @@ type ConsumerBalanceTracker struct {
 type transactorRegistrationStatusProvider interface {
 	FetchRegistrationFees(chainID int64) (registry.FeesResponse, error)
 	FetchRegistrationStatus(id string) ([]registry.TransactorStatusResponse, error)
+}
+
+type blockchainInfoProvider interface {
+	GetConsumerChannelsHermes(chainID int64, channelAddress common.Address) (client.ConsumersHermes, error)
 }
 
 // PollConfig sets the interval and timeout for polling.
@@ -105,6 +111,7 @@ func NewConsumerBalanceTracker(
 	transactorRegistrationStatusProvider transactorRegistrationStatusProvider,
 	registry registrationStatusProvider,
 	addressProvider addressProvider,
+	blockchainInfoProvider blockchainInfoProvider,
 	cfg ConsumerBalanceTrackerConfig,
 ) *ConsumerBalanceTracker {
 	return &ConsumerBalanceTracker{
@@ -115,6 +122,7 @@ func NewConsumerBalanceTracker(
 		consumerGrandTotalsStorage:           consumerGrandTotalsStorage,
 		consumerInfoGetter:                   consumerInfoGetter,
 		transactorRegistrationStatusProvider: transactorRegistrationStatusProvider,
+		blockchainInfoProvider:               blockchainInfoProvider,
 		registry:                             registry,
 		addressProvider:                      addressProvider,
 		stop:                                 make(chan struct{}),
@@ -125,7 +133,7 @@ func NewConsumerBalanceTracker(
 }
 
 type consumerInfoGetter interface {
-	GetConsumerData(chainID int64, id string) (HermesUserInfo, error)
+	GetConsumerData(chainID int64, id string, cacheDuration time.Duration) (HermesUserInfo, error)
 }
 
 type consumerBalanceChecker interface {
@@ -269,7 +277,7 @@ func (cbt *ConsumerBalanceTracker) handleGrandTotalChanged(ev event.AppEventGran
 }
 
 func (cbt *ConsumerBalanceTracker) getUnregisteredChannelBalance(chainID int64, id identity.Identity) (*big.Int, error) {
-	addr, err := cbt.addressProvider.GetChannelAddress(chainID, id)
+	addr, err := cbt.addressProvider.GetActiveChannelAddress(chainID, id.ToCommonAddress())
 	if err != nil {
 		return new(big.Int), err
 	}
@@ -333,14 +341,14 @@ func (cbt *ConsumerBalanceTracker) periodicSync(stop <-chan struct{}, chainID in
 	}
 }
 
-func (cbt *ConsumerBalanceTracker) alignWithHermes(chainID int64, id identity.Identity) (*big.Int, error) {
+func (cbt *ConsumerBalanceTracker) alignWithHermes(chainID int64, id identity.Identity) (*big.Int, *big.Int, error) {
 	var boff backoff.BackOff
 	eback := backoff.NewExponentialBackOff()
 	eback.MaxElapsedTime = time.Second * 15
 	eback.InitialInterval = time.Second * 1
 
 	boff = backoff.WithMaxRetries(eback, 5)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	go func() {
@@ -353,8 +361,9 @@ func (cbt *ConsumerBalanceTracker) alignWithHermes(chainID int64, id identity.Id
 
 	boff = backoff.WithContext(boff, ctx)
 	balance := cbt.GetBalance(chainID, id)
+	promised := new(big.Int)
 	alignBalance := func() error {
-		consumer, err := cbt.consumerInfoGetter.GetConsumerData(chainID, id.Address)
+		consumer, err := cbt.consumerInfoGetter.GetConsumerData(chainID, id.Address, 5*time.Second)
 		if err != nil {
 			var syntax *json.SyntaxError
 			if errors.As(err, &syntax) {
@@ -377,9 +386,15 @@ func (cbt *ConsumerBalanceTracker) alignWithHermes(chainID int64, id identity.Id
 			return errBalanceNotOffchain
 		}
 
-		promised := new(big.Int)
 		if consumer.LatestPromise.Amount != nil {
 			promised = consumer.LatestPromise.Amount
+		}
+
+		if isSettledBiggerThanPromised(consumer.Settled, promised) {
+			promised, err = cbt.getPromisedWhenSettledIsBigger(consumer, promised, chainID, id.ToCommonAddress())
+			if err != nil {
+				return err
+			}
 		}
 
 		previous, _ := cbt.getBalance(chainID, id)
@@ -397,7 +412,7 @@ func (cbt *ConsumerBalanceTracker) alignWithHermes(chainID int64, id identity.Id
 		return nil
 	}
 
-	return balance, backoff.Retry(alignBalance, boff)
+	return balance, promised, backoff.Retry(alignBalance, boff)
 }
 
 // ForceBalanceUpdateCached forces a balance update for the given identity only if the last call to this func was done no sooner than a minute ago.
@@ -444,7 +459,7 @@ func (cbt *ConsumerBalanceTracker) ForceBalanceUpdate(chainID int64, id identity
 		fallback.BCBalance = big.NewInt(0)
 	}
 
-	addr, err := cbt.addressProvider.GetChannelAddress(chainID, id)
+	addr, err := cbt.addressProvider.GetActiveChannelAddress(chainID, id.ToCommonAddress())
 	if err != nil {
 		log.Error().Err(err).Msg("Could not calculate channel address")
 		return fallback.BCBalance
@@ -456,7 +471,7 @@ func (cbt *ConsumerBalanceTracker) ForceBalanceUpdate(chainID int64, id identity
 		return new(big.Int)
 	}
 
-	balance, err := cbt.alignWithHermes(chainID, id)
+	balance, lastPromised, err := cbt.alignWithHermes(chainID, id)
 	if err != nil {
 		if !errors.Is(err, errBalanceNotOffchain) {
 			log.Error().Err(err).Msg("align with hermes failed with a critical error, offchain balance out of sync")
@@ -511,18 +526,19 @@ func (cbt *ConsumerBalanceTracker) ForceBalanceUpdate(chainID int64, id identity
 	}
 
 	grandTotal, err := cbt.consumerGrandTotalsStorage.Get(chainID, id, hermes)
-	if errors.Is(err, ErrNotFound) {
-		if err := cbt.recoverGrandTotalPromised(chainID, id); err != nil {
+	if errors.Is(err, ErrNotFound) || (err == nil && lastPromised != nil && grandTotal.Cmp(lastPromised) == -1) {
+		err := cbt.consumerGrandTotalsStorage.Store(chainID, id, hermes, lastPromised)
+		if err != nil {
 			log.Error().Err(err).Msg("Could not recover Grand Total Promised")
 		}
-		grandTotal, err = cbt.consumerGrandTotalsStorage.Get(chainID, id, hermes)
+		grandTotal = lastPromised
 	}
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		log.Error().Err(err).Msg("Could not get consumer grand total promised")
 		return fallback.BCBalance
 	}
 
-	var before = new(big.Int)
+	before := new(big.Int)
 	if v, ok := cbt.getBalance(chainID, id); ok {
 		before = v.GetBalance()
 	}
@@ -557,7 +573,7 @@ func (cbt *ConsumerBalanceTracker) alignWithTransactor(chainID int64, id identit
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	go func() {
@@ -596,7 +612,7 @@ func (cbt *ConsumerBalanceTracker) getTransactorBalance(ctx context.Context, cha
 		return nil
 	}
 
-	if data.BountyAmount.Cmp(big.NewInt(0)) == 0 {
+	if data.BountyAmount == nil || data.BountyAmount.Cmp(big.NewInt(0)) == 0 {
 		// if we've got no bounty, get myst balance from BC and use that as bounty
 		b, err := cbt.getUnregisteredChannelBalance(chainID, id)
 		if err != nil {
@@ -618,7 +634,7 @@ func (cbt *ConsumerBalanceTracker) recoverGrandTotalPromised(chainID int64, iden
 	eback.InitialInterval = time.Second * 2
 
 	boff = backoff.WithMaxRetries(eback, 10)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	go func() {
@@ -632,7 +648,7 @@ func (cbt *ConsumerBalanceTracker) recoverGrandTotalPromised(chainID int64, iden
 	var data HermesUserInfo
 	boff = backoff.WithContext(boff, ctx)
 	toRetry := func() error {
-		d, err := cbt.consumerInfoGetter.GetConsumerData(chainID, identity.Address)
+		d, err := cbt.consumerInfoGetter.GetConsumerData(chainID, identity.Address, time.Minute)
 		if err != nil {
 			if !errors.Is(err, ErrHermesNotFound) {
 				return err
@@ -648,11 +664,20 @@ func (cbt *ConsumerBalanceTracker) recoverGrandTotalPromised(chainID int64, iden
 		return err
 	}
 
-	if data.LatestPromise.Amount == nil {
-		data.LatestPromise.Amount = new(big.Int)
+	latestPromised := big.NewInt(0)
+	if data.LatestPromise.Amount != nil {
+		latestPromised = data.LatestPromise.Amount
 	}
 
-	log.Debug().Msgf("Loaded hermes state: already promised: %v", data.LatestPromise.Amount)
+	if isSettledBiggerThanPromised(data.Settled, latestPromised) {
+		var err error
+		latestPromised, err = cbt.getPromisedWhenSettledIsBigger(data, latestPromised, chainID, identity.ToCommonAddress())
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Debug().Msgf("Loaded hermes state: already promised: %v", latestPromised)
 
 	hermes, err := cbt.addressProvider.GetActiveHermes(chainID)
 	if err != nil {
@@ -660,7 +685,7 @@ func (cbt *ConsumerBalanceTracker) recoverGrandTotalPromised(chainID int64, iden
 		return err
 	}
 
-	return cbt.consumerGrandTotalsStorage.Store(chainID, identity, hermes, data.LatestPromise.Amount)
+	return cbt.consumerGrandTotalsStorage.Store(chainID, identity, hermes, latestPromised)
 }
 
 func (cbt *ConsumerBalanceTracker) handleStopEvent() {
@@ -761,6 +786,24 @@ func (cbt *ConsumerBalanceTracker) identityRegistrationStatus(ctx context.Contex
 	return data, backoff.Retry(toRetry, boff)
 }
 
+func (cbt *ConsumerBalanceTracker) getPromisedWhenSettledIsBigger(data HermesUserInfo, latestPromised *big.Int, chainID int64, identityAddress common.Address) (*big.Int, error) {
+	if data.IsOffchain {
+		return data.Settled, nil
+	}
+
+	activeChannelAddress, err := cbt.addressProvider.GetActiveChannelAddress(chainID, identityAddress)
+	if err != nil {
+		return nil, fmt.Errorf("error getting active channel address: %w", err)
+	}
+
+	consumerHermes, err := cbt.blockchainInfoProvider.GetConsumerChannelsHermes(chainID, activeChannelAddress)
+	if err != nil {
+		return nil, fmt.Errorf("error getting consumer channels hermes: %w", err)
+	}
+
+	return consumerHermes.Settled, nil
+}
+
 func safeSub(a, b *big.Int) *big.Int {
 	if a == nil || b == nil {
 		return new(big.Int)
@@ -770,6 +813,10 @@ func safeSub(a, b *big.Int) *big.Int {
 		return new(big.Int).Sub(a, b)
 	}
 	return new(big.Int)
+}
+
+func isSettledBiggerThanPromised(settled, promised *big.Int) bool {
+	return settled != nil && settled.Cmp(promised) == 1
 }
 
 // ConsumerBalance represents the consumer balance

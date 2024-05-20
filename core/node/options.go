@@ -60,6 +60,7 @@ type Options struct {
 	TequilapiPort          int
 	FlagTequilapiDebugMode bool
 	TequilapiEnabled       bool
+	TequilapiSecured       bool
 	BindAddress            string
 	UI                     OptionsUI
 	FeedbackURL            string
@@ -72,6 +73,7 @@ type Options struct {
 	Quality    OptionsQuality
 	Location   OptionsLocation
 	Transactor OptionsTransactor
+	Affiliator OptionsAffiliator
 	Chains     OptionsChains
 
 	Openvpn  Openvpn
@@ -80,21 +82,23 @@ type Options struct {
 	Payments OptionsPayments
 
 	Consumer bool
+	Mobile   bool
 
 	SwarmDialerDNSHeadstart time.Duration
 	PilvytisAddress         string
+	ObserverAddress         string
+	SSE                     OptionsSSE
 }
 
 // GetOptions retrieves node options from the app configuration.
 func GetOptions() *Options {
 	network := OptionsNetwork{
-		Localnet:            config.GetBool(config.FlagLocalnet),
-		Mainnet:             config.GetBool(config.FlagMainnet),
-		MysteriumAPIAddress: config.GetString(config.FlagAPIAddress),
-		BrokerAddresses:     config.GetStringSlice(config.FlagBrokerAddress),
-		EtherClientRPCL1:    config.GetStringSlice(config.FlagEtherRPCL1),
-		EtherClientRPCL2:    config.GetStringSlice(config.FlagEtherRPCL2),
-		ChainID:             config.GetInt64(config.FlagChainID),
+		Network:          config.GetBlockchainNetwork(config.FlagBlockchainNetwork),
+		DiscoveryAddress: config.GetString(config.FlagDiscoveryAddress),
+		BrokerAddresses:  config.GetStringSlice(config.FlagBrokerAddress),
+		EtherClientRPCL1: config.GetStringSlice(config.FlagEtherRPCL1),
+		EtherClientRPCL2: config.GetStringSlice(config.FlagEtherRPCL2),
+		ChainID:          config.GetInt64(config.FlagChainID),
 		DNSMap: map[string][]string{
 			"location.mysterium.network": {"51.158.129.204"},
 			"quality.mysterium.network":  {"51.158.129.204"},
@@ -143,12 +147,18 @@ func GetOptions() *Options {
 		Transactor: OptionsTransactor{
 			TransactorEndpointAddress:       config.GetString(config.FlagTransactorAddress),
 			ProviderMaxRegistrationAttempts: config.GetInt(config.FlagTransactorProviderMaxRegistrationAttempts),
-			ProviderRegistrationRetryDelay:  config.GetDuration(config.FlagTransactorProviderRegistrationRetryDelay),
+			TransactorFeesValidTime:         config.GetDuration(config.FlagTransactorFeesValidTime),
+			TryFreeRegistration:             config.GetBool(config.FlagProviderTryFreeRegistration),
+		},
+		Affiliator: OptionsAffiliator{
+			AffiliatorEndpointAddress: config.GetString(config.FlagAffiliatorAddress),
 		},
 		Payments: OptionsPayments{
 			MaxAllowedPaymentPercentile:    config.GetInt(config.FlagPaymentsMaxHermesFee),
 			BCTimeout:                      config.GetDuration(config.FlagPaymentsBCTimeout),
 			HermesPromiseSettlingThreshold: config.GetFloat64(config.FlagPaymentsHermesPromiseSettleThreshold),
+			MaxFeeSettlingThreshold:        config.GetFloat64(config.FlagPaymentsPromiseSettleMaxFeeThreshold),
+			MaxUnSettledAmount:             config.GetFloat64(config.FlagPaymentsUnsettledMaxAmount),
 			SettlementTimeout:              config.GetDuration(config.FlagPaymentsHermesPromiseSettleTimeout),
 			SettlementRecheckInterval:      config.GetDuration(config.FlagPaymentsHermesPromiseSettleCheckInterval),
 			BalanceLongPollInterval:        config.GetDuration(config.FlagPaymentsLongBalancePollInterval),
@@ -157,10 +167,13 @@ func GetOptions() *Options {
 			RegistryTransactorPollInterval: config.GetDuration(config.FlagPaymentsRegistryTransactorPollInterval),
 			RegistryTransactorPollTimeout:  config.GetDuration(config.FlagPaymentsRegistryTransactorPollTimeout),
 			ConsumerDataLeewayMegabytes:    config.GetUInt64(config.FlagPaymentsConsumerDataLeewayMegabytes),
-			ProviderInvoiceFrequency:       config.GetDuration(config.FlagPaymentsProviderInvoiceFrequency),
-			MaxUnpaidInvoiceValue:          config.GetBigInt(config.FlagPaymentsMaxUnpaidInvoiceValue),
 			HermesStatusRecheckInterval:    config.GetDuration(config.FlagPaymentsHermesStatusRecheckInterval),
-			ZeroStakeSettlementThreshold:   config.GetFloat64(config.FlagPaymentsZeroStakeUnsettledAmount),
+			MinAutoSettleAmount:            config.GetFloat64(config.FlagPaymentsZeroStakeUnsettledAmount),
+
+			ProviderInvoiceFrequency:      config.GetDuration(config.FlagPaymentsProviderInvoiceFrequency),
+			ProviderLimitInvoiceFrequency: config.GetDuration(config.FlagPaymentsLimitProviderInvoiceFrequency),
+			MaxUnpaidInvoiceValue:         config.GetBigInt(config.FlagPaymentsUnpaidInvoiceValue),
+			LimitUnpaidInvoiceValue:       config.GetBigInt(config.FlagPaymentsLimitUnpaidInvoiceValue),
 		},
 		Chains: OptionsChains{
 			Chain1: metadata.ChainDefinition{
@@ -169,6 +182,7 @@ func GetOptions() *Options {
 				ChannelImplAddress: config.GetString(config.FlagChain1ChannelImplementationAddress),
 				ChainID:            config.GetInt64(config.FlagChain1ChainID),
 				MystAddress:        config.GetString(config.FlagChain1MystAddress),
+				KnownHermeses:      config.GetStringSlice(config.FlagChain1KnownHermeses),
 			},
 			Chain2: metadata.ChainDefinition{
 				RegistryAddress:    config.GetString(config.FlagChain2RegistryAddress),
@@ -176,6 +190,7 @@ func GetOptions() *Options {
 				ChannelImplAddress: config.GetString(config.FlagChain2ChannelImplementationAddress),
 				ChainID:            config.GetInt64(config.FlagChain2ChainID),
 				MystAddress:        config.GetString(config.FlagChain2MystAddress),
+				KnownHermeses:      config.GetStringSlice(config.FlagChain2KnownHermeses),
 			},
 		},
 		Openvpn: wrapper{nodeOptions: openvpn_core.NodeOptions{
@@ -186,6 +201,10 @@ func GetOptions() *Options {
 		},
 		Consumer:        config.GetBool(config.FlagConsumer),
 		PilvytisAddress: config.GetString(config.FlagPilvytisAddress),
+		ObserverAddress: config.GetString(config.FlagObserverAddress),
+		SSE: OptionsSSE{
+			Enabled: config.GetBool(config.FlagSSEEnable),
+		},
 	}
 }
 

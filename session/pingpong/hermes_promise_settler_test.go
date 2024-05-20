@@ -33,6 +33,7 @@ import (
 	"github.com/mysteriumnetwork/payments/bindings"
 	"github.com/mysteriumnetwork/payments/client"
 	"github.com/mysteriumnetwork/payments/crypto"
+	"github.com/mysteriumnetwork/payments/units"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -45,6 +46,7 @@ func TestPromiseSettler_loadInitialState(t *testing.T) {
 		},
 	}
 	ks := identity.NewMockKeystore()
+	lbs := newMockAddressStorage()
 
 	fac := &mockHermesCallerFactory{}
 
@@ -61,6 +63,8 @@ func TestPromiseSettler_loadInitialState(t *testing.T) {
 		ks,
 		&settlementHistoryStorageMock{},
 		&mockPublisher{},
+		&mockObserver{},
+		lbs,
 		cfg)
 
 	settler.currentState[mockID] = settlementState{}
@@ -84,7 +88,8 @@ func TestPromiseSettler_loadInitialState(t *testing.T) {
 
 	v = settler.currentState[mockID]
 	assert.EqualValues(t, settlementState{
-		registered: true,
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
 	}, v)
 
 	// check if will resync
@@ -122,6 +127,7 @@ func TestPromiseSettler_handleRegistrationEvent(t *testing.T) {
 	}
 	ks := identity.NewMockKeystore()
 	fac := &mockHermesCallerFactory{}
+	lbs := newMockAddressStorage()
 
 	settler := NewHermesPromiseSettler(
 		&mockTransactor{},
@@ -136,6 +142,8 @@ func TestPromiseSettler_handleRegistrationEvent(t *testing.T) {
 		ks,
 		&settlementHistoryStorageMock{},
 		&mockPublisher{},
+		&mockObserver{},
+		lbs,
 		cfg)
 
 	statusesWithNoChangeExpected := []registry.RegistrationStatus{registry.Unregistered, registry.InProgress, registry.RegistrationError}
@@ -172,10 +180,18 @@ func TestPromiseSettler_handleHermesPromiseReceived(t *testing.T) {
 	}
 	ks := identity.NewMockKeystore()
 	fac := &mockHermesCallerFactory{}
-	settler := NewHermesPromiseSettler(&mockTransactor{}, &mockHermesPromiseStorage{}, &mockPayAndSettler{}, &mockAddressProvider{}, fac.Get, &mockHermesURLGetter{}, channelProvider, channelStatusProvider, mrsp, ks, &settlementHistoryStorageMock{}, &mockPublisher{}, cfg)
+	tm := &mockTransactor{
+		feesToReturn: registry.FeesResponse{
+			Fee:        units.FloatEthToBigIntWei(0.05),
+			ValidUntil: time.Now().Add(30 * time.Minute),
+		},
+	}
+	lbs := newMockAddressStorage()
+
+	settler := NewHermesPromiseSettler(tm, &mockHermesPromiseStorage{}, &mockPayAndSettler{}, &mockAddressProvider{}, fac.Get, &mockHermesURLGetter{}, channelProvider, channelStatusProvider, mrsp, ks, &settlementHistoryStorageMock{}, &mockPublisher{}, &mockObserver{}, lbs, cfg)
 
 	// no receive on unknown provider
-	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, mockProviderChannel, HermesPromise{})
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, mockProviderChannel, HermesPromise{}, beneficiaryID)
 	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
 		HermesID:   hermesID,
 		ProviderID: mockID,
@@ -184,9 +200,10 @@ func TestPromiseSettler_handleHermesPromiseReceived(t *testing.T) {
 
 	// no receive should be gotten on a non registered provider
 	settler.currentState[mockID] = settlementState{
-		registered: false,
+		registered:       false,
+		settleInProgress: map[common.Address]struct{}{},
 	}
-	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, mockProviderChannel, HermesPromise{})
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, mockProviderChannel, HermesPromise{}, beneficiaryID)
 	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
 		HermesID:   hermesID,
 		ProviderID: mockID,
@@ -195,11 +212,12 @@ func TestPromiseSettler_handleHermesPromiseReceived(t *testing.T) {
 
 	// should receive on registered provider. Should also expect a recalculated balance to be added to the settlementState
 	expectedChannel := client.ProviderChannel{Stake: big.NewInt(1000)}
-	expectedPromise := crypto.Promise{Amount: big.NewInt(9000)}
+	expectedPromise := crypto.Promise{Amount: units.FloatEthToBigIntWei(6)}
 	settler.currentState[mockID] = settlementState{
-		registered: true,
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
 	}
-	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, expectedChannel, HermesPromise{Promise: expectedPromise})
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, expectedChannel, HermesPromise{Promise: expectedPromise}, beneficiaryID)
 	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
 		HermesID:   hermesID,
 		ProviderID: mockID,
@@ -210,19 +228,127 @@ func TestPromiseSettler_handleHermesPromiseReceived(t *testing.T) {
 	assert.Equal(t, mockID, p.provider)
 
 	// should not receive here due to balance being large and stake being small
-	expectedChannel = client.ProviderChannel{Stake: big.NewInt(0)}
-	expectedPromise = crypto.Promise{Amount: big.NewInt(8900)}
+	expectedChannel = client.ProviderChannel{
+		Stake:   big.NewInt(0),
+		Settled: units.FloatEthToBigIntWei(6),
+	}
+	expectedPromise = crypto.Promise{Amount: units.FloatEthToBigIntWei(8)}
 	settler.currentState[mockID] = settlementState{
 		registered:       true,
-		settleInProgress: false,
+		settleInProgress: map[common.Address]struct{}{},
 	}
-	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, mockProviderChannel, HermesPromise{Promise: expectedPromise})
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, expectedChannel, HermesPromise{Promise: expectedPromise}, beneficiaryID)
 	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
 		HermesID:   hermesID,
 		ProviderID: mockID,
 		Promise:    expectedPromise,
 	})
 	assertNoReceive(t, settler.settleQueue)
+}
+
+func TestPromiseSettler_handleHermesPromiseReceivedWithLocalBeneficiary(t *testing.T) {
+	channelProvider := &mockHermesChannelProvider{}
+	channelStatusProvider := &mockProviderChannelStatusProvider{}
+	mrsp := &mockRegistrationStatusProvider{
+		identities: map[string]mockRegistrationStatus{
+			mockChainIdentity: {
+				status: registry.Registered,
+			},
+		},
+	}
+	ks := identity.NewMockKeystore()
+	fac := &mockHermesCallerFactory{}
+	tm := &mockTransactor{
+		feesToReturn: registry.FeesResponse{
+			Fee:        units.FloatEthToBigIntWei(0.05),
+			ValidUntil: time.Now().Add(30 * time.Minute),
+		},
+	}
+	lbs := newMockAddressStorage()
+
+	settler := NewHermesPromiseSettler(tm, &mockHermesPromiseStorage{}, &mockPayAndSettler{}, &mockAddressProvider{}, fac.Get, &mockHermesURLGetter{}, channelProvider, channelStatusProvider, mrsp, ks, &settlementHistoryStorageMock{}, &mockPublisher{}, &mockObserver{}, lbs, cfg)
+
+	expectedChannel := client.ProviderChannel{Stake: big.NewInt(1000)}
+	expectedPromise := crypto.Promise{Amount: units.FloatEthToBigIntWei(6)}
+	settler.currentState[mockID] = settlementState{
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
+	}
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, expectedChannel, HermesPromise{Promise: expectedPromise}, beneficiaryID)
+	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
+		HermesID:   hermesID,
+		ProviderID: mockID,
+		Promise:    expectedPromise,
+	})
+
+	p := <-settler.settleQueue
+	assert.Equal(t, mockID, p.provider)
+	assert.Equal(t, beneficiaryID, p.beneficiary)
+
+	localBeneficiary := common.HexToAddress("0x00000000000000000000000000000000000000133")
+	err := lbs.Save(mockID.Address, localBeneficiary.Hex())
+	assert.NoError(t, err)
+
+	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
+		HermesID:   hermesID,
+		ProviderID: mockID,
+		Promise:    expectedPromise,
+	})
+	p = <-settler.settleQueue
+	assert.Equal(t, mockID, p.provider)
+}
+
+func TestPromiseSettler_doNotSettleIfBeneficiaryIsAChannel(t *testing.T) {
+	channelProvider := &mockHermesChannelProvider{}
+	channelStatusProvider := &mockProviderChannelStatusProvider{}
+	mrsp := &mockRegistrationStatusProvider{
+		identities: map[string]mockRegistrationStatus{
+			mockChainIdentity: {
+				status: registry.Registered,
+			},
+		},
+	}
+	ks := identity.NewMockKeystore()
+	fac := &mockHermesCallerFactory{}
+	tm := &mockTransactor{
+		feesToReturn: registry.FeesResponse{
+			Fee:        units.FloatEthToBigIntWei(0.05),
+			ValidUntil: time.Now().Add(30 * time.Minute),
+		},
+	}
+	lbs := newMockAddressStorage()
+
+	mockAddressProvider := newMockAddressProvider()
+	settler := NewHermesPromiseSettler(tm, &mockHermesPromiseStorage{}, &mockPayAndSettler{}, mockAddressProvider, fac.Get, &mockHermesURLGetter{}, channelProvider, channelStatusProvider, mrsp, ks, &settlementHistoryStorageMock{}, &mockPublisher{}, &mockObserver{}, lbs, cfg)
+
+	expectedChannel := client.ProviderChannel{Stake: big.NewInt(1000)}
+	expectedPromise := crypto.Promise{Amount: units.FloatEthToBigIntWei(6)}
+	settler.currentState[mockID] = settlementState{
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
+	}
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, expectedChannel, HermesPromise{Promise: expectedPromise}, beneficiaryID)
+	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
+		HermesID:   hermesID,
+		ProviderID: mockID,
+		Promise:    expectedPromise,
+	})
+
+	p := <-settler.settleQueue
+	assert.Equal(t, mockID, p.provider)
+	assert.Equal(t, beneficiaryID, p.beneficiary)
+
+	mockAddressProvider.setChannelAddress(0, mockID.ToCommonAddress(), beneficiaryID)
+	channelProvider.channelToReturn = NewHermesChannel("1", mockID, hermesID, expectedChannel, HermesPromise{Promise: expectedPromise}, beneficiaryID)
+	settler.handleHermesPromiseReceived(event.AppEventHermesPromise{
+		HermesID:   hermesID,
+		ProviderID: mockID,
+		Promise:    expectedPromise,
+	})
+
+	p = <-settler.settleQueue
+	assert.Equal(t, mockID, p.provider)
+	assert.Equal(t, beneficiaryID, p.beneficiary)
 }
 
 func assertNoReceive(t *testing.T, ch chan receivedPromise) {
@@ -242,6 +368,8 @@ func TestPromiseSettler_handleNodeStart(t *testing.T) {
 	assert.NoError(t, err)
 	acc2, err := ks.NewAccount("")
 	assert.NoError(t, err)
+
+	lbs := newMockAddressStorage()
 
 	mrsp := &mockRegistrationStatusProvider{
 		identities: map[string]mockRegistrationStatus{
@@ -268,6 +396,8 @@ func TestPromiseSettler_handleNodeStart(t *testing.T) {
 		ks,
 		&settlementHistoryStorageMock{},
 		&mockPublisher{},
+		&mockObserver{},
+		lbs,
 		cfg)
 
 	settler.handleNodeStart()
@@ -289,7 +419,7 @@ func TestPromiseSettler_RejectsIfFeesExceedSettlementAmount(t *testing.T) {
 	hermesFee := big.NewInt(25000)
 
 	promiseSettler := hermesPromiseSettler{
-		currentState: make(map[identity.Identity]settlementState),
+		currentState: map[identity.Identity]settlementState{},
 		transactor: &mockTransactor{
 			feesToReturn: registry.FeesResponse{
 				Fee: transactorFee,
@@ -310,8 +440,39 @@ func TestPromiseSettler_RejectsIfFeesExceedSettlementAmount(t *testing.T) {
 	settled := big.NewInt(6000)
 
 	mockSettler := func(crypto.Promise) (string, error) { return "", nil }
-	err := promiseSettler.settle(mockSettler, identity.Identity{}, common.Address{}, mockPromise, common.Address{}, settled)
-	assert.Equal(t, "settlement fees exceed earning amount. Please provide more service and try again. Current earnings: 29000, current fees: 30000", err.Error())
+	err := promiseSettler.settle(mockSettler, identity.Identity{}, common.Address{}, mockPromise, common.Address{}, settled, nil)
+	assert.Equal(t, "settlement fees exceed earning amount. Please provide more service and try again. Current earnings: 29000, current fees: 30000: fee not covered, cannot continue", err.Error())
+}
+
+func TestPromiseSettler_RejectsIfFeesExceedMaxFee(t *testing.T) {
+	fac := &mockHermesCallerFactory{}
+	transactorFee := units.FloatEthToBigIntWei(0.8)
+	hermesFee := big.NewInt(25000)
+
+	promiseSettler := hermesPromiseSettler{
+		currentState: map[identity.Identity]settlementState{},
+		transactor: &mockTransactor{
+			feesToReturn: registry.FeesResponse{
+				Fee: transactorFee,
+			},
+		},
+		hermesCallerFactory: fac.Get,
+		hermesURLGetter:     &mockHermesURLGetter{},
+		bc: &mockProviderChannelStatusProvider{
+			calculatedFees: hermesFee,
+		},
+	}
+
+	mockPromise := crypto.Promise{
+		Fee:    transactorFee,
+		Amount: big.NewInt(35000),
+	}
+
+	settled := big.NewInt(6000)
+
+	mockSettler := func(crypto.Promise) (string, error) { return "", nil }
+	err := promiseSettler.settle(mockSettler, identity.Identity{}, common.Address{}, mockPromise, common.Address{}, settled, units.FloatEthToBigIntWei(0.6))
+	assert.Equal(t, "current fee is more than the max", err.Error())
 }
 
 func TestPromiseSettler_AcceptsIfFeesDoNotExceedSettlementAmount(t *testing.T) {
@@ -321,14 +482,21 @@ func TestPromiseSettler_AcceptsIfFeesDoNotExceedSettlementAmount(t *testing.T) {
 	expectedChannel, err := hex.DecodeString("d0bb35eb0e4a0c972f2c154f91cf676b804762bef69c7fe4cef38642c3ac7ffc")
 	assert.NoError(t, err)
 
+	expectedR, err := hex.DecodeString("d56e23228dc2c7d2cc2e0ee08d7d6e5be6aa196c9f95046d83fab06913d2a9c2")
+	assert.NoError(t, err)
+
 	var arr [32]byte
 	copy(arr[:], expectedChannel)
+
+	var r [32]byte
+	copy(r[:], expectedR)
 	bc := &mockProviderChannelStatusProvider{
 		calculatedFees: hermesFee,
 		subCancel:      func() {},
 		promiseEventsToReturn: []bindings.HermesImplementationPromiseSettled{
 			{
 				ChannelId: arr,
+				Lock:      r,
 			},
 		},
 		headerToReturn: &types.Header{
@@ -364,13 +532,14 @@ func TestPromiseSettler_AcceptsIfFeesDoNotExceedSettlementAmount(t *testing.T) {
 	mockPromise := crypto.Promise{
 		Fee:    transactorFee,
 		Amount: big.NewInt(35000),
+		R:      r[:],
 	}
 
 	settled := big.NewInt(6000)
 
 	mockSettler := func(crypto.Promise) (string, error) { return "", nil }
 
-	err = promiseSettler.settle(mockSettler, identity.Identity{Address: "0x92fE1c838b08dB4c072DDa805FB4292d9b76B5E7"}, common.HexToAddress("0x07b5fD382b5e375F202184052BeF2C50b3B1404F"), mockPromise, common.Address{}, settled)
+	err = promiseSettler.settle(mockSettler, identity.Identity{Address: "0x92fE1c838b08dB4c072DDa805FB4292d9b76B5E7"}, common.HexToAddress("0x07b5fD382b5e375F202184052BeF2C50b3B1404F"), mockPromise, common.Address{}, settled, nil)
 	assert.NoError(t, err)
 	ev := <-publisher.publicationChan
 	assert.Equal(t, event.AppTopicSettlementComplete, ev.name)
@@ -379,20 +548,107 @@ func TestPromiseSettler_AcceptsIfFeesDoNotExceedSettlementAmount(t *testing.T) {
 }
 
 func TestPromiseSettlerState_needsSettling(t *testing.T) {
+	hps := &hermesPromiseSettler{
+		transactor: &mockTransactor{
+			feesToReturn: registry.FeesResponse{
+				Fee:        units.FloatEthToBigIntWei(2.0),
+				ValidUntil: time.Now().Add(30 * time.Minute),
+			},
+		},
+	}
 	s := settlementState{
-		registered: true,
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
 	}
 	channel := NewHermesChannel(
 		"1",
 		mockID,
 		hermesID,
-		client.ProviderChannel{Stake: big.NewInt(1000)},
-		HermesPromise{Promise: crypto.Promise{Amount: big.NewInt(1000)}},
+		client.ProviderChannel{Stake: big.NewInt(0)},
+		HermesPromise{Promise: crypto.Promise{Amount: units.FloatEthToBigIntWei(10.1)}},
+		beneficiaryID,
 	)
-	assert.True(t, s.needsSettling(0.1, 0.0, channel), "should be true with zero balance left")
+	needs, maxFee := hps.needsSettling(s, 0, 0.1, 5, 10, channel, 1)
+	assert.True(t, needs, "should be true with balance more than max regardless of fees")
+	assert.Nil(t, maxFee, "should be nil")
+
+	hps = &hermesPromiseSettler{
+		transactor: &mockTransactor{
+			feesToReturn: registry.FeesResponse{
+				Fee:        units.FloatEthToBigIntWei(0.045),
+				ValidUntil: time.Now().Add(30 * time.Minute),
+			},
+		},
+	}
+	s = settlementState{
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
+	}
+	channel = NewHermesChannel(
+		"1",
+		mockID,
+		hermesID,
+		client.ProviderChannel{Stake: big.NewInt(0)},
+		HermesPromise{Promise: crypto.Promise{Amount: units.FloatEthToBigIntWei(5)}},
+		beneficiaryID,
+	)
+
+	needs, maxFee = hps.needsSettling(s, 0, 0.01, 5, 10, channel, 1)
+	assert.True(t, needs, "should be true if fees are 1%% of unsettled amount")
+	assert.True(t, maxFee.Cmp(units.FloatEthToBigIntWei(0.045)) > 0, "should be bigger than current fee")
+
+	s.registered = false
+	needs, _ = hps.needsSettling(s, 0, 0.01, 5, 10, channel, 1)
+	assert.False(t, needs, "should be false with no registration")
+
+	s.settleInProgress = map[common.Address]struct{}{
+		hermesID: {},
+	}
+	needs, _ = hps.needsSettling(s, 0, 0.01, 5, 10, channel, 1)
+	assert.False(t, needs, "should be false with settle in progress")
+
+	hps = &hermesPromiseSettler{
+		transactor: &mockTransactor{
+			feesToReturn: registry.FeesResponse{
+				Fee:        units.FloatEthToBigIntWei(0.051),
+				ValidUntil: time.Now().Add(30 * time.Minute),
+			},
+		},
+	}
+	s = settlementState{
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
+	}
+	channel = NewHermesChannel(
+		"1",
+		mockID,
+		hermesID,
+		client.ProviderChannel{Stake: big.NewInt(0)},
+		HermesPromise{Promise: crypto.Promise{Amount: big.NewInt(8999)}},
+		beneficiaryID,
+	)
+	needs, _ = hps.needsSettling(s, 0, 0.01, 5, 10, channel, 1)
+	assert.False(t, needs, "should be false with fee more than 1%% of unsettled amount")
 
 	s = settlementState{
-		registered: true,
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
+	}
+	channel = NewHermesChannel(
+		"1",
+		mockID,
+		hermesID,
+		client.ProviderChannel{Stake: big.NewInt(1000)},
+		HermesPromise{Promise: crypto.Promise{Amount: big.NewInt(1000)}},
+		beneficiaryID,
+	)
+	needs, maxFee = hps.needsSettling(s, 0.1, 0.01, 5, 10, channel, 1)
+	assert.True(t, needs, "should be true with zero balance left")
+	assert.Nil(t, maxFee, "should be nil")
+
+	s = settlementState{
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
 	}
 	channel = NewHermesChannel(
 		"1",
@@ -400,17 +656,15 @@ func TestPromiseSettlerState_needsSettling(t *testing.T) {
 		hermesID,
 		client.ProviderChannel{Stake: big.NewInt(1000)},
 		HermesPromise{Promise: crypto.Promise{Amount: big.NewInt(9000)}},
+		beneficiaryID,
 	)
-	assert.True(t, s.needsSettling(0.1, 0.0, channel), "should be true with 10% missing")
-
-	s.registered = false
-	assert.False(t, s.needsSettling(0.1, 0.0, channel), "should be false with no registration")
-
-	s.settleInProgress = true
-	assert.False(t, s.needsSettling(0.1, 0.0, channel), "should be false with settle in progress")
+	needs, maxFee = hps.needsSettling(s, 0.1, 0.01, 5, 10, channel, 1)
+	assert.True(t, needs, "should be true with 10% missing")
+	assert.Nil(t, maxFee, "should be nil")
 
 	s = settlementState{
-		registered: true,
+		registered:       true,
+		settleInProgress: map[common.Address]struct{}{},
 	}
 	channel = NewHermesChannel(
 		"1",
@@ -418,8 +672,10 @@ func TestPromiseSettlerState_needsSettling(t *testing.T) {
 		hermesID,
 		client.ProviderChannel{Stake: big.NewInt(10000)},
 		HermesPromise{Promise: crypto.Promise{Amount: big.NewInt(8999)}},
+		beneficiaryID,
 	)
-	assert.False(t, s.needsSettling(0.1, 0.0, channel), "should be false with 10.01% missing")
+	needs, _ = hps.needsSettling(s, 0.1, 0.01, 5, 10, channel, 1)
+	assert.False(t, needs, "should be false with 10.01% missing")
 }
 
 // mocks start here
@@ -438,6 +694,12 @@ type mockProviderChannelStatusProvider struct {
 	errorToReturn         error
 	promiseEventsToReturn []bindings.HermesImplementationPromiseSettled
 	promiseError          error
+}
+
+func (mpcsp *mockProviderChannelStatusProvider) TransactionReceipt(chainID int64, hash common.Hash) (*types.Receipt, error) {
+	r := &types.Receipt{}
+	r.Status = types.ReceiptStatusSuccessful
+	return r, nil
 }
 
 func (mpcsp *mockProviderChannelStatusProvider) GetProviderChannel(chainID int64, hermesAddress common.Address, addressToCheck common.Address, pending bool) (client.ProviderChannel, error) {
@@ -473,7 +735,9 @@ func (mpcsp *mockProviderChannelStatusProvider) HeaderByNumber(chainID int64, nu
 }
 
 var cfg = HermesPromiseSettlerConfig{
-	Threshold:               0.1,
+	MaxFeeThreshold:         0.01,
+	MinAutoSettleAmount:     5,
+	MaxUnSettledAmount:      20,
 	SettlementCheckTimeout:  time.Millisecond * 10,
 	SettlementCheckInterval: time.Millisecond * 1,
 }
@@ -511,6 +775,7 @@ func (mrsp *mockRegistrationStatusProvider) GetRegistrationStatus(chainID int64,
 var errMock = errors.New("explosions everywhere")
 var mockID = identity.FromAddress("0x0000000000000000000000000000000000000001")
 var hermesID = common.HexToAddress("0x00000000000000000000000000000000000000002")
+var beneficiaryID = common.HexToAddress("0x00000000000000000000000000000000000000132")
 var mockChainIdentity = "0" + mockID.Address
 
 var mockProviderChannel = client.ProviderChannel{
@@ -573,5 +838,22 @@ func (shsm *settlementHistoryStorageMock) Store(_ SettlementHistoryEntry) error 
 type mockPayAndSettler struct{}
 
 func (mpas *mockPayAndSettler) PayAndSettle(r []byte, em crypto.ExchangeMessage, providerID identity.Identity, sessionID string) <-chan error {
+	return nil
+}
+
+type mockAddressStorage struct {
+	data map[string]string
+}
+
+func newMockAddressStorage() *mockAddressStorage {
+	return &mockAddressStorage{data: make(map[string]string)}
+}
+
+func (m mockAddressStorage) Address(identity string) (string, error) {
+	return m.data[identity], nil
+}
+
+func (m mockAddressStorage) Save(identity, address string) error {
+	m.data[identity] = address
 	return nil
 }

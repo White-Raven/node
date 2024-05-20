@@ -25,17 +25,14 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/gin-gonic/gin"
+	"github.com/mysteriumnetwork/go-rest/apierror"
+	"github.com/mysteriumnetwork/node/identity"
+	"github.com/mysteriumnetwork/node/identity/registry"
 	"github.com/mysteriumnetwork/node/session/pingpong"
 	pingpongEvent "github.com/mysteriumnetwork/node/session/pingpong/event"
 	"github.com/mysteriumnetwork/payments/client"
-
-	"github.com/gin-gonic/gin"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/mysteriumnetwork/node/identity"
-	"github.com/mysteriumnetwork/node/identity/registry"
-	"github.com/mysteriumnetwork/node/mocks"
-	"github.com/mysteriumnetwork/node/requests"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -49,7 +46,21 @@ var (
 	newIdentity = identity.Identity{Address: "0x000000000000000000000000000000000000aaac"}
 )
 
+type mockBeneficiaryProvider struct {
+	b common.Address
+}
+
+func (ms *mockBeneficiaryProvider) GetBeneficiary(identity common.Address) (common.Address, error) {
+	return ms.b, nil
+}
+
 type selectorFake struct {
+}
+
+func summonTestGin() *gin.Engine {
+	g := gin.Default()
+	g.Use(apierror.ErrorHandler)
+	return g
 }
 
 func (hf *selectorFake) UseOrCreate(address, _ string, _ int64) (identity.Identity, error) {
@@ -79,7 +90,7 @@ func TestCurrentIdentitySuccess(t *testing.T) {
 		selector: &selectorFake{},
 	}
 
-	g := gin.Default()
+	g := summonTestGin()
 	g.PUT("/identities/current", endpoint.Current)
 
 	g.ServeHTTP(resp, req)
@@ -106,7 +117,7 @@ func TestUnlockIdentitySuccess(t *testing.T) {
 
 	endpoint := &identitiesAPI{idm: mockIdm}
 
-	g := gin.Default()
+	g := summonTestGin()
 	g.PUT("/identities/:id/unlock", endpoint.Unlock)
 
 	g.ServeHTTP(resp, req)
@@ -129,7 +140,7 @@ func TestUnlockIdentityWithInvalidJSON(t *testing.T) {
 	assert.Nil(t, err)
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.PUT("/identities/:id/unlock", endpoint.Unlock)
 
 	g.ServeHTTP(resp, req)
@@ -148,20 +159,105 @@ func TestUnlockIdentityWithNoPassphrase(t *testing.T) {
 	assert.NoError(t, err)
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.PUT("/identities/:id/unlock", endpoint.Unlock)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
 	assert.JSONEq(
 		t,
 		`{
-			"message": "validation_error",
-			"errors" : {
-				"passphrase": [ {"code" : "required" , "message" : "Field is required" } ]
-			}
-		}`,
+  "error": {
+    "code": "validation_failed",
+    "message": "Request validation failed",
+    "detail": "Request validation failed: passphrase: 'passphrase' is required [required]",
+    "fields": {
+      "passphrase": {
+        "code": "required",
+        "message": "'passphrase' is required"
+      }
+    }
+  },
+  "status": 400,
+  "path": "/identities/0x000000000000000000000000000000000000000a/unlock"
+}`,
+		resp.Body.String(),
+	)
+}
+
+func TestBeneficiaryWithChannel(t *testing.T) {
+	mockIdm := identity.NewIdentityManagerFake(existingIdentities, newIdentity)
+	resp := httptest.NewRecorder()
+	req, err := http.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/identities/%s/beneficiary", "0x000000000000000000000000000000000000000a"),
+		nil,
+	)
+	assert.Nil(t, err)
+
+	endpoint := &identitiesAPI{
+		idm: mockIdm,
+		addressProvider: &mockAddressProvider{
+			hermesToReturn:         common.HexToAddress("0x000000000000000000000000000000000000000b"),
+			registryToReturn:       common.HexToAddress("0x00000000000000000000000000000000000000cb"),
+			channelToReturn:        common.HexToAddress("0x0000000000000000000000000000000000000ddb"),
+			channelAddressToReturn: common.HexToAddress("0x0000000000000000000000000000000000001234"),
+		},
+		bprovider: &mockBeneficiaryProvider{
+			b: common.HexToAddress("0x0000000000000000000000000000000000001234"),
+		},
+	}
+	g := summonTestGin()
+	g.GET("/identities/:id/beneficiary", endpoint.Beneficiary)
+
+	g.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.JSONEq(
+		t,
+		`{
+			"beneficiary":"0x0000000000000000000000000000000000001234",
+			"is_channel_address":true
+  		}`,
+		resp.Body.String(),
+	)
+}
+
+func TestBeneficiaryWithoutChannel(t *testing.T) {
+	mockIdm := identity.NewIdentityManagerFake(existingIdentities, newIdentity)
+	resp := httptest.NewRecorder()
+	req, err := http.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/identities/%s/beneficiary", "0x000000000000000000000000000000000000000a"),
+		nil,
+	)
+	assert.Nil(t, err)
+
+	endpoint := &identitiesAPI{
+		idm: mockIdm,
+		addressProvider: &mockAddressProvider{
+			hermesToReturn:         common.HexToAddress("0x000000000000000000000000000000000000000b"),
+			registryToReturn:       common.HexToAddress("0x00000000000000000000000000000000000000cb"),
+			channelToReturn:        common.HexToAddress("0x0000000000000000000000000000000000000ddb"),
+			channelAddressToReturn: common.HexToAddress("0x000000000000000000000000000000000000eeeb"),
+		},
+		bprovider: &mockBeneficiaryProvider{
+			b: common.HexToAddress("0x0000000000000000000000000000000000000123"),
+		},
+	}
+	g := summonTestGin()
+	g.GET("/identities/:id/beneficiary", endpoint.Beneficiary)
+
+	g.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.JSONEq(
+		t,
+		`{
+			"beneficiary":"0x0000000000000000000000000000000000000123",
+			"is_channel_address":false
+  		}`,
 		resp.Body.String(),
 	)
 }
@@ -179,7 +275,7 @@ func TestUnlockFailure(t *testing.T) {
 	mockIdm.MarkUnlockToFail()
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.PUT("/identities/:id/unlock", endpoint.Unlock)
 
 	g.ServeHTTP(resp, req)
@@ -202,7 +298,7 @@ func TestCreateNewIdentityEmptyPassphrase(t *testing.T) {
 	assert.Nil(t, err)
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.POST("/identities", endpoint.Create)
 
 	g.ServeHTTP(resp, req)
@@ -221,20 +317,30 @@ func TestCreateNewIdentityNoPassphrase(t *testing.T) {
 	assert.Nil(t, err)
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.POST("/identities", endpoint.Create)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
+	fmt.Println(resp.Body.String())
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
 	assert.JSONEq(
 		t,
 		`{
-			"message": "validation_error",
-			"errors" : {
-				"passphrase": [ {"code" : "required" , "message" : "Field is required" } ]
-			}
-		}`,
+  "error": {
+    "code": "validation_failed",
+    "message": "Request validation failed",
+    "detail": "Request validation failed: passphrase: 'passphrase' is required [required]",
+    "fields": {
+      "passphrase": {
+        "code": "required",
+        "message": "'passphrase' is required"
+      }
+    }
+  },
+  "status": 400,
+  "path": "/identities"
+}`,
 		resp.Body.String(),
 	)
 }
@@ -250,7 +356,7 @@ func TestCreateNewIdentity(t *testing.T) {
 	assert.Nil(t, err)
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.POST("/identities", endpoint.Create)
 
 	g.ServeHTTP(resp, req)
@@ -271,7 +377,7 @@ func TestListIdentities(t *testing.T) {
 	resp := httptest.NewRecorder()
 
 	endpoint := &identitiesAPI{idm: mockIdm}
-	g := gin.Default()
+	g := summonTestGin()
 	g.GET(path, endpoint.List)
 
 	g.ServeHTTP(resp, req)
@@ -288,33 +394,11 @@ func TestListIdentities(t *testing.T) {
 	)
 }
 
-func Test_ReferralTokenGet(t *testing.T) {
-	server := newTestTransactorServer(http.StatusAccepted, `{"token":"yay-free-myst"}`)
-	tr := registry.NewTransactor(requests.NewHTTPClient(server.URL, requests.DefaultTimeout), server.URL, &mockAddressProvider{}, fakeSignerFactory, mocks.NewEventBus(), nil)
-	endpoint := &identitiesAPI{transactor: tr}
-
-	router := gin.Default()
-	router.GET("/identities/:id/referral", endpoint.GetReferralToken)
-
-	tokenRequest := `{"identity": "0x0"}`
-	req, err := http.NewRequest(
-		http.MethodGet,
-		"/identities/0x0/referral",
-		bytes.NewBufferString(tokenRequest),
-	)
-	assert.Nil(t, err)
-
-	resp := httptest.NewRecorder()
-	router.ServeHTTP(resp, req)
-	assert.Equal(t, http.StatusOK, resp.Code)
-	assert.JSONEq(t, `{"token":"yay-free-myst"}`, resp.Body.String())
-}
-
 func Test_IdentityGet(t *testing.T) {
 	endpoint := &identitiesAPI{
 		idm:      identity.NewIdentityManagerFake(existingIdentities, newIdentity),
 		registry: &registry.FakeRegistry{RegistrationStatus: registry.Registered},
-		channelCalculator: &mockAddressProvider{
+		addressProvider: &mockAddressProvider{
 			channelAddressToReturn: common.HexToAddress("0x100000000000000000000000000000000000000a"),
 			hermesToReturn:         common.HexToAddress("0x200000000000000000000000000000000000000a"),
 		},
@@ -327,9 +411,17 @@ func Test_IdentityGet(t *testing.T) {
 			},
 		},
 		earningsProvider: &mockEarningsProvider{
-			earnings: pingpongEvent.Earnings{
-				LifetimeBalance:  big.NewInt(100),
-				UnsettledBalance: big.NewInt(50),
+			earnings: pingpongEvent.EarningsDetailed{
+				Total: pingpongEvent.Earnings{
+					LifetimeBalance:  big.NewInt(100),
+					UnsettledBalance: big.NewInt(50),
+				},
+				PerHermes: map[common.Address]pingpongEvent.Earnings{
+					common.HexToAddress("0x200000000000000000000000000000000000000a"): {
+						LifetimeBalance:  big.NewInt(100),
+						UnsettledBalance: big.NewInt(50),
+					},
+				},
 			},
 		},
 		balanceProvider: &mockBalanceProvider{
@@ -350,22 +442,47 @@ func Test_IdentityGet(t *testing.T) {
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	assert.Equal(t, http.StatusOK, resp.Code)
+
 	assert.JSONEq(t,
 		`
 {
-  "id": "0x000000000000000000000000000000000000000a",
-  "registration_status": "Registered",
-  "channel_address": "0x100000000000000000000000000000000000000A",
-  "balance": 25,
-  "balance_tokens": {
-    "wei": "25",
-    "ether": "0.000000000000000025",
-    "human": "0"
-  },
-  "earnings": 50,
-  "earnings_total": 100,
-  "stake": 2,
-  "hermes_id": "0x200000000000000000000000000000000000000A"
+	"id": "0x000000000000000000000000000000000000000a",
+	"registration_status": "Registered",
+	"channel_address": "0x100000000000000000000000000000000000000A",
+	"balance": 25,
+	"earnings": 50,
+	"earnings_total": 100,
+	"balance_tokens": {
+		"wei": "25",
+		"ether": "0.000000000000000025",
+		"human": "0"
+	},
+	"earnings_tokens": {
+		"wei": "50",
+		"ether": "0.00000000000000005",
+		"human": "0"
+	},
+	"earnings_total_tokens": {
+		"wei": "100",
+		"ether": "0.0000000000000001",
+		"human": "0"
+	},
+	"stake": 2,
+	"hermes_id": "0x200000000000000000000000000000000000000A",
+	"earnings_per_hermes": {
+		"0x200000000000000000000000000000000000000A": {
+			"earnings": {
+				"wei": "50",
+				"ether": "0.00000000000000005",
+				"human": "0"
+			},
+			"earnings_total": {
+				"wei": "100",
+				"ether": "0.0000000000000001",
+				"human": "0"
+			}
+		}
+	}
 }
 `,
 		resp.Body.String())
@@ -378,7 +495,15 @@ type mockAddressProvider struct {
 	channelAddressToReturn common.Address
 }
 
-func (ma *mockAddressProvider) GetChannelImplementation(chainID int64) (common.Address, error) {
+func (ma *mockAddressProvider) GetActiveChannelImplementation(chainID int64) (common.Address, error) {
+	return ma.channelToReturn, nil
+}
+
+func (ma *mockAddressProvider) GetChannelImplementationForHermes(chainID int64, hermes common.Address) (common.Address, error) {
+	return ma.channelToReturn, nil
+}
+
+func (ma *mockAddressProvider) GetMystAddress(chainID int64) (common.Address, error) {
 	return ma.channelToReturn, nil
 }
 
@@ -390,8 +515,16 @@ func (ma *mockAddressProvider) GetRegistryAddress(chainID int64) (common.Address
 	return ma.registryToReturn, nil
 }
 
-func (ma *mockAddressProvider) GetChannelAddress(chainID int64, id identity.Identity) (common.Address, error) {
+func (ma *mockAddressProvider) GetActiveChannelAddress(chainID int64, id common.Address) (common.Address, error) {
 	return ma.channelAddressToReturn, nil
+}
+
+func (ma *mockAddressProvider) GetHermesChannelAddress(chainID int64, id, hermes common.Address) (common.Address, error) {
+	return ma.channelAddressToReturn, nil
+}
+
+func (ma *mockAddressProvider) GetKnownHermeses(chainID int64) ([]common.Address, error) {
+	return []common.Address{ma.hermesToReturn}, nil
 }
 
 type mockProviderChannelStatusProvider struct {
@@ -403,7 +536,7 @@ func (m *mockProviderChannelStatusProvider) GetProviderChannel(chainID int64, he
 }
 
 type mockEarningsProvider struct {
-	earnings pingpongEvent.Earnings
+	earnings pingpongEvent.EarningsDetailed
 	channels []pingpong.HermesChannel
 }
 
@@ -411,8 +544,8 @@ func (mep *mockEarningsProvider) List(chainID int64) []pingpong.HermesChannel {
 	return mep.channels
 }
 
-func (mep *mockEarningsProvider) GetEarnings(chainID int64, _ identity.Identity) pingpongEvent.Earnings {
-	return mep.earnings
+func (mep *mockEarningsProvider) GetEarningsDetailed(chainID int64, _ identity.Identity) *pingpongEvent.EarningsDetailed {
+	return &mep.earnings
 }
 
 type mockBalanceProvider struct {

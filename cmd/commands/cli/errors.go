@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/mysteriumnetwork/go-rest/apierror"
 )
 
 var (
@@ -30,10 +32,14 @@ var (
 )
 
 func errUnknownSubCommand(cmd string) error {
-	return fmt.Errorf("unknown sub-command '%s'\n", cmd)
+	return fmt.Errorf("unknown sub-command '%s'", cmd)
 }
 
 func formatForHuman(err error) string {
+	var apiErr *apierror.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Detail()
+	}
 	msg := err.Error()
 	if len(msg) < 1 {
 		return msg

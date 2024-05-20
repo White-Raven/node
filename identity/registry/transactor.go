@@ -21,20 +21,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/mysteriumnetwork/node/eventbus"
-	"github.com/mysteriumnetwork/node/identity"
-	"github.com/mysteriumnetwork/node/requests"
 	"github.com/mysteriumnetwork/payments/client"
 	pc "github.com/mysteriumnetwork/payments/crypto"
 	"github.com/mysteriumnetwork/payments/registration"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+
+	"github.com/mysteriumnetwork/node/eventbus"
+	"github.com/mysteriumnetwork/node/identity"
+	"github.com/mysteriumnetwork/node/requests"
 )
 
 // AppTopicTransactorRegistration represents the registration topic to which events regarding registration attempts on transactor will occur
@@ -47,9 +46,64 @@ type channelProvider interface {
 
 // AddressProvider provides sc addresses.
 type AddressProvider interface {
-	GetChannelImplementation(chainID int64) (common.Address, error)
+	GetActiveChannelImplementation(chainID int64) (common.Address, error)
 	GetActiveHermes(chainID int64) (common.Address, error)
 	GetRegistryAddress(chainID int64) (common.Address, error)
+	GetKnownHermeses(chainID int64) ([]common.Address, error)
+	GetChannelImplementationForHermes(chainID int64, hermes common.Address) (common.Address, error)
+	GetMystAddress(chainID int64) (common.Address, error)
+}
+
+type feeType uint8
+
+const (
+	settleFeeType        feeType = iota
+	registrationFeeType          = 1
+	stakeDecreaseFeeType         = 2
+)
+
+type feeCacher struct {
+	validityDuration time.Duration
+	feesMap          map[int64]map[feeType]feeCache
+}
+
+type feeCache struct {
+	FeesResponse
+	CacheValidUntil time.Time
+}
+
+func newFeeCacher(validityDuration time.Duration) *feeCacher {
+	return &feeCacher{
+		validityDuration: validityDuration,
+		feesMap:          make(map[int64]map[feeType]feeCache),
+	}
+}
+
+func (f *feeCacher) getCachedFee(chainId int64, feeType feeType) *FeesResponse {
+	if chainFees, ok := f.feesMap[chainId]; ok {
+		if fees, ok := chainFees[feeType]; ok {
+			if fees.CacheValidUntil.After(time.Now()) {
+				return &fees.FeesResponse
+			}
+		}
+	}
+	return nil
+}
+
+func (f *feeCacher) cacheFee(chainId int64, ftype feeType, response FeesResponse) {
+	_, ok := f.feesMap[chainId]
+	if !ok {
+		f.feesMap[chainId] = make(map[feeType]feeCache)
+	}
+	cacheExpiration := time.Now().Add(f.validityDuration)
+	feeCache := feeCache{
+		FeesResponse:    response,
+		CacheValidUntil: cacheExpiration,
+	}
+	if feeCache.CacheValidUntil.After(response.ValidUntil) {
+		feeCache.CacheValidUntil = response.ValidUntil
+	}
+	f.feesMap[chainId][ftype] = feeCache
 }
 
 // Transactor allows for convenient calls to the transactor service
@@ -60,10 +114,11 @@ type Transactor struct {
 	publisher       eventbus.Publisher
 	bc              channelProvider
 	addresser       AddressProvider
+	feeCache        *feeCacher
 }
 
 // NewTransactor creates and returns new Transactor instance
-func NewTransactor(httpClient *requests.HTTPClient, endpointAddress string, addresser AddressProvider, signerFactory identity.SignerFactory, publisher eventbus.Publisher, bc channelProvider) *Transactor {
+func NewTransactor(httpClient *requests.HTTPClient, endpointAddress string, addresser AddressProvider, signerFactory identity.SignerFactory, publisher eventbus.Publisher, bc channelProvider, feesValidTime time.Duration) *Transactor {
 	return &Transactor{
 		httpClient:      httpClient,
 		endpointAddress: endpointAddress,
@@ -71,6 +126,7 @@ func NewTransactor(httpClient *requests.HTTPClient, endpointAddress string, addr
 		addresser:       addresser,
 		publisher:       publisher,
 		bc:              bc,
+		feeCache:        newFeeCacher(feesValidTime),
 	}
 }
 
@@ -117,35 +173,83 @@ type PromiseSettlementRequest struct {
 
 // FetchRegistrationFees fetches current transactor registration fees
 func (t *Transactor) FetchRegistrationFees(chainID int64) (FeesResponse, error) {
-	f := FeesResponse{}
+	cachedFees := t.feeCache.getCachedFee(chainID, registrationFeeType)
+	if cachedFees != nil {
+		return *cachedFees, nil
+	}
 
+	f := FeesResponse{}
 	req, err := requests.NewGetRequest(t.endpointAddress, fmt.Sprintf("fee/%v/register", chainID), nil)
 	if err != nil {
 		return f, errors.Wrap(err, "failed to fetch transactor fees")
 	}
 
 	err = t.httpClient.DoRequestAndParseResponse(req, &f)
+	if err == nil {
+		t.feeCache.cacheFee(chainID, registrationFeeType, f)
+	}
 	return f, err
 }
 
 // FetchSettleFees fetches current transactor settlement fees
 func (t *Transactor) FetchSettleFees(chainID int64) (FeesResponse, error) {
-	f := FeesResponse{}
+	cachedFees := t.feeCache.getCachedFee(chainID, settleFeeType)
+	if cachedFees != nil {
+		return *cachedFees, nil
+	}
 
+	f := FeesResponse{}
 	req, err := requests.NewGetRequest(t.endpointAddress, fmt.Sprintf("fee/%v/settle", chainID), nil)
 	if err != nil {
 		return f, errors.Wrap(err, "failed to fetch transactor fees")
 	}
 
 	err = t.httpClient.DoRequestAndParseResponse(req, &f)
+	if err == nil {
+		t.feeCache.cacheFee(chainID, settleFeeType, f)
+	}
 	return f, err
 }
 
 // FetchStakeDecreaseFee fetches current transactor stake decrease fees.
 func (t *Transactor) FetchStakeDecreaseFee(chainID int64) (FeesResponse, error) {
-	f := FeesResponse{}
+	cachedFees := t.feeCache.getCachedFee(chainID, stakeDecreaseFeeType)
+	if cachedFees != nil {
+		return *cachedFees, nil
+	}
 
+	f := FeesResponse{}
 	req, err := requests.NewGetRequest(t.endpointAddress, fmt.Sprintf("fee/%v/stake/decrease", chainID), nil)
+	if err != nil {
+		return f, errors.Wrap(err, "failed to fetch transactor fees")
+	}
+
+	err = t.httpClient.DoRequestAndParseResponse(req, &f)
+	if err == nil {
+		t.feeCache.cacheFee(chainID, stakeDecreaseFeeType, f)
+	}
+	return f, err
+}
+
+// CombinedFeesResponse represents the combined fees response.
+type CombinedFeesResponse struct {
+	Current    Fees      `json:"current"`
+	Last       Fees      `json:"last"`
+	ServerTime time.Time `json:"server_time"`
+}
+
+// Fees represents fees for a given time frame.
+type Fees struct {
+	DecreaseStake *big.Int  `json:"decreaseStake"`
+	Settle        *big.Int  `json:"settle"`
+	Register      *big.Int  `json:"register"`
+	ValidUntil    time.Time `json:"valid_until"`
+}
+
+// FetchCombinedFees fetches current transactor fees.
+func (t *Transactor) FetchCombinedFees(chainID int64) (CombinedFeesResponse, error) {
+	f := CombinedFeesResponse{}
+	req, err := requests.NewGetRequest(t.endpointAddress, fmt.Sprintf("fee/%v", chainID), nil)
 	if err != nil {
 		return f, errors.Wrap(err, "failed to fetch transactor fees")
 	}
@@ -203,11 +307,6 @@ func (t *Transactor) registerIdentity(endpoint string, id string, stake, fee *bi
 	return nil
 }
 
-// RegisterProvider registers a provider if free registration slots are available.
-func (t *Transactor) RegisterProvider(id string, stake, fee *big.Int, beneficiary string, chainID int64) error {
-	return t.registerIdentity("identity/register/provider", id, stake, fee, beneficiary, chainID)
-}
-
 type identityRegistrationRequestWithToken struct {
 	IdentityRegistrationRequest
 	Token string `json:"token"`
@@ -251,22 +350,19 @@ type TokenRewardResponse struct {
 	Reward *big.Int `json:"reward"`
 }
 
-// GetTokenReward returns the reward that is issued for the given token.
-func (t *Transactor) GetTokenReward(token string) (TokenRewardResponse, error) {
-	f := TokenRewardResponse{}
-	req, err := requests.NewGetRequest(t.endpointAddress, fmt.Sprintf("referal/%v/reward", token), nil)
-	if err != nil {
-		return f, fmt.Errorf("failed to fetch transactor fees %w", err)
-	}
-
-	err = t.httpClient.DoRequestAndParseResponse(req, &f)
-	return f, err
-}
-
 // RegisterIdentity instructs Transactor to register identity on behalf of a client identified by 'id'
 func (t *Transactor) RegisterIdentity(id string, stake, fee *big.Int, beneficiary string, chainID int64, referralToken *string) error {
 	if referralToken == nil {
 		return t.registerIdentity("identity/register", id, stake, fee, beneficiary, chainID)
+	}
+
+	return t.registerIdentityWithReferralToken(id, stake, beneficiary, *referralToken, chainID)
+}
+
+// RegisterProviderIdentity instructs Transactor to register Provider on behalf of a client identified by 'id'
+func (t *Transactor) RegisterProviderIdentity(id string, stake, fee *big.Int, beneficiary string, chainID int64, referralToken *string) error {
+	if referralToken == nil {
+		return t.registerIdentity("identity/register/provider", id, stake, fee, beneficiary, chainID)
 	}
 
 	return t.registerIdentityWithReferralToken(id, stake, beneficiary, *referralToken, chainID)
@@ -283,7 +379,7 @@ func (t *Transactor) fillIdentityRegistrationRequest(id string, stake, fee *big.
 		return IdentityRegistrationRequest{}, err
 	}
 
-	chimp, err := t.addresser.GetChannelImplementation(chainID)
+	chimp, err := t.addresser.GetActiveChannelImplementation(chainID)
 	if err != nil {
 		return IdentityRegistrationRequest{}, err
 	}
@@ -332,76 +428,12 @@ func (t *Transactor) fillIdentityRegistrationRequest(id string, stake, fee *big.
 	return regReq, nil
 }
 
-// GetReferralToken returns the referral token.
-func (t *Transactor) GetReferralToken(id common.Address) (string, error) {
-	req, err := t.getReferralTokenRequest(id)
-	if err != nil {
-		return "", err
-	}
-
-	request, err := requests.NewPostRequest(t.endpointAddress, "rp/tokens/request", req)
-	if err != nil {
-		return "", fmt.Errorf("failed to create referral token request %w", err)
-	}
-
-	var resp struct {
-		Token string `json:"token"`
-	}
-	err = t.httpClient.DoRequestAndParseResponse(request, &resp)
-	return resp.Token, err
-}
-
-// ReferralTokenAvailable checks if user is eligible to obtain a referral token.
-func (t *Transactor) ReferralTokenAvailable(id common.Address) error {
-	query := url.Values{}
-	query.Set("identity", id.String())
-	req, err := requests.NewGetRequest(t.endpointAddress, "rp/tokens-available", query)
-	if err != nil {
-		return err
-	}
-	return t.httpClient.DoRequest(req)
-}
-
 func (t *Transactor) getReferralTokenRequest(id common.Address) (pc.ReferralTokenRequest, error) {
 	signature, err := t.signerFactory(identity.FromAddress(id.Hex())).Sign(id.Bytes())
 	return pc.ReferralTokenRequest{
 		Identity:  id,
 		Signature: hex.EncodeToString(signature.Bytes()),
 	}, err
-}
-
-// CheckIfRegistrationBountyEligible determines if the identity is eligible for registration bounty
-func (t *Transactor) CheckIfRegistrationBountyEligible(identity identity.Identity) (bool, error) {
-	signer := t.signerFactory(identity)
-	message := common.HexToAddress(identity.Address)
-	signature, err := signer.Sign(message.Bytes())
-	if err != nil {
-		return false, err
-	}
-
-	req := pc.ReferralTokenRequest{
-		Identity:  common.HexToAddress(identity.Address),
-		Signature: hex.EncodeToString(signature.Bytes()),
-	}
-
-	request, err := requests.NewPostRequest(t.endpointAddress, "identity/register/bounty", req)
-	if err != nil {
-		return false, fmt.Errorf("failed to create RegisterIdentity request %w", err)
-	}
-
-	resp, err := t.httpClient.Do(request)
-	if err != nil {
-		return false, fmt.Errorf("failed to check bounty status %w", err)
-	}
-
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
-	}
-
-	return false, fmt.Errorf("got unexpected status from bounty check %v", resp.StatusCode)
 }
 
 func (t *Transactor) validateRegisterIdentityRequest(regReq IdentityRegistrationRequest) error {
@@ -437,6 +469,126 @@ func (t *Transactor) signRegistrationRequest(signer identity.Signer, regReq Iden
 	}
 
 	return signature.Bytes(), nil
+}
+
+// OpenChannelRequest represents the open consumer channel request body
+type OpenChannelRequest struct {
+	TransactorFee   *big.Int `json:"transactorFee"`
+	Signature       string   `json:"signature"`
+	HermesID        string   `json:"hermesID"`
+	ChainID         int64    `json:"chainID"`
+	RegistryAddress string   `json:"registry_address"`
+}
+
+// sign OpenChannelRequest by identity's signer
+func (t *Transactor) signOpenChannelRequest(signer identity.Signer, req *OpenChannelRequest) error {
+	r := registration.OpenConsumerChannelRequest{
+		ChainID:         req.ChainID,
+		HermesID:        req.HermesID,
+		TransactorFee:   req.TransactorFee,
+		RegistryAddress: req.RegistryAddress,
+	}
+	message := r.GetMessage()
+
+	signature, err := signer.Sign(message)
+	if err != nil {
+		return fmt.Errorf("failed to sign a open channel request: %w", err)
+	}
+
+	err = pc.ReformatSignatureVForBC(signature.Bytes())
+	if err != nil {
+		return fmt.Errorf("signature reformat failed: %w", err)
+	}
+
+	signatureHex := common.Bytes2Hex(signature.Bytes())
+	req.Signature = strings.ToLower(fmt.Sprintf("0x%v", signatureHex))
+
+	return nil
+}
+
+// create request for open  channel
+func (t *Transactor) createOpenChannelRequest(chainID int64, id, hermesID, registryAddress string) (OpenChannelRequest, error) {
+	request := OpenChannelRequest{
+		TransactorFee:   new(big.Int),
+		HermesID:        hermesID,
+		ChainID:         chainID,
+		RegistryAddress: registryAddress,
+	}
+
+	signer := t.signerFactory(identity.FromAddress(id))
+	err := t.signOpenChannelRequest(signer, &request)
+	if err != nil {
+		return request, fmt.Errorf("failed to sign open channel request: %w", err)
+	}
+
+	return request, nil
+}
+
+// OpenChannel opens payment channel for consumer for certain Hermes
+func (t *Transactor) OpenChannel(chainID int64, id, hermesID, registryAddress string) error {
+	endpoint := "channel/open"
+	request, err := t.createOpenChannelRequest(chainID, id, hermesID, registryAddress)
+	if err != nil {
+		return fmt.Errorf("failed to create open channel request: %w", err)
+	}
+
+	req, err := requests.NewPostRequest(t.endpointAddress, endpoint, request)
+	if err != nil {
+		return fmt.Errorf("failed to do open channel request: %w", err)
+	}
+
+	return t.httpClient.DoRequest(req)
+}
+
+// ChannelStatusRequest request for channel status
+type ChannelStatusRequest struct {
+	Identity        string `json:"identity"`
+	HermesID        string `json:"hermesID"`
+	ChainID         int64  `json:"chainID"`
+	RegistryAddress string `json:"registry_address"`
+}
+
+// ChannelStatus represents status of the channel
+type ChannelStatus = string
+
+const (
+	// ChannelStatusNotFound channel is not opened and the request was not sent
+	ChannelStatusNotFound = ChannelStatus("not_found")
+	// ChannelStatusOpen channel successfully opened
+	ChannelStatusOpen = ChannelStatus("open")
+	// ChannelStatusFail channel open transaction fails
+	ChannelStatusFail = ChannelStatus("fail")
+	// ChannelStatusInProgress channel opening is in progress
+	ChannelStatusInProgress = ChannelStatus("in_progress")
+)
+
+// ChannelStatusResponse represents response with channel status
+type ChannelStatusResponse struct {
+	Status ChannelStatus `json:"status"`
+}
+
+// ChannelStatus check the status of the channel
+func (t *Transactor) ChannelStatus(chainID int64, id, hermesID, registryAddress string) (ChannelStatusResponse, error) {
+	endpoint := "channel/status"
+	request := ChannelStatusRequest{
+		HermesID:        hermesID,
+		Identity:        id,
+		ChainID:         chainID,
+		RegistryAddress: registryAddress,
+	}
+
+	req, err := requests.NewPostRequest(t.endpointAddress, endpoint, request)
+	if err != nil {
+		return ChannelStatusResponse{}, fmt.Errorf("failed to create channel status request: %w", err)
+	}
+
+	res := ChannelStatusResponse{}
+	err = t.httpClient.DoRequestAndParseResponse(req, &res)
+	if err != nil {
+		return ChannelStatusResponse{}, fmt.Errorf("failed to do channel status request: %w", err)
+	}
+
+	return res, nil
 }
 
 // SettleWithBeneficiaryRequest represent the request for setting new beneficiary address.
@@ -702,21 +854,6 @@ func (t *Transactor) DecreaseStake(id string, chainID int64, amount, transactorF
 		return errors.Wrap(err, "failed to create decrease stake request")
 	}
 	return t.httpClient.DoRequest(req)
-}
-
-// RegistrationTokenReward returns the amount of MYST rewarder for token used.
-func (t *Transactor) RegistrationTokenReward(token string) (*big.Int, error) {
-	req, err := requests.NewGetRequest(t.endpointAddress, fmt.Sprintf("register-reward/token/%s", token), nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to token reward amount")
-	}
-
-	var resp struct {
-		Reward *big.Int `json:"reward"`
-	}
-
-	err = t.httpClient.DoRequestAndParseResponse(req, &resp)
-	return resp.Reward, err
 }
 
 func (t *Transactor) fillDecreaseStakeRequest(id string, chainID int64, amount, transactorFee *big.Int) (DecreaseProviderStakeRequest, error) {

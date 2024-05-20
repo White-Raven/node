@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/gin-contrib/cors"
-
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/tequilapi/middlewares"
 
 	"github.com/mysteriumnetwork/node/core/node"
@@ -57,10 +57,15 @@ type apiServer struct {
 	gin *gin.Engine
 }
 
+type jwtAuthenticator interface {
+	ValidateToken(token string) (bool, error)
+}
+
 // NewServer creates http api server for given address port and http handler
 func NewServer(
 	listener net.Listener,
 	nodeOptions node.Options,
+	authenticator jwtAuthenticator,
 	handlers []func(e *gin.Engine) error,
 ) (APIServer, error) {
 	gin.SetMode(modeFromOptions(nodeOptions))
@@ -69,6 +74,15 @@ func NewServer(
 	g.Use(gin.Recovery())
 	g.Use(cors.New(corsConfig))
 	g.Use(middlewares.NewHostFilter())
+	g.Use(apierror.ErrorHandler)
+
+	if nodeOptions.TequilapiSecured {
+		g.Use(middlewares.ApplyMiddlewareTokenAuth(authenticator))
+	}
+
+	// Set to protect localhost-only endpoints due to use of nodeUI proxy
+	// With this set, context.ClientIP() will return only IP set by trusted proxy, not by a client!
+	g.SetTrustedProxies([]string{"127.0.0.1"})
 
 	for _, h := range handlers {
 		err := h(g)

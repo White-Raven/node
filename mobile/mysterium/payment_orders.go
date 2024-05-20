@@ -23,6 +23,7 @@ import (
 
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/pilvytis"
+	"github.com/mysteriumnetwork/payments/exchange"
 )
 
 // PaymentOrderResponse represents a payment order for mobile usage.
@@ -44,7 +45,7 @@ type PaymentOrderResponse struct {
 	PublicGatewayData json.RawMessage `json:"public_gateway_data"`
 }
 
-func newPaymentOrderResponse(r pilvytis.PaymentOrderResponse) PaymentOrderResponse {
+func newPaymentOrderResponse(r pilvytis.GatewayOrderResponse) PaymentOrderResponse {
 	return PaymentOrderResponse{
 		ID:                r.ID,
 		Status:            r.Status.Status(),
@@ -116,9 +117,14 @@ func newGatewayReponse(g []pilvytis.GatewaysResponse) []GatewaysResponse {
 	return result
 }
 
+// GetGatewaysRequest request for GetGateways.
+type GetGatewaysRequest struct {
+	OptionsCurrency string
+}
+
 // GetGateways returns possible payment gateways.
-func (mb *MobileNode) GetGateways() ([]byte, error) {
-	gateways, err := mb.pilvytis.GetPaymentGateways()
+func (mb *MobileNode) GetGateways(req *GetGatewaysRequest) ([]byte, error) {
+	gateways, err := mb.pilvytis.GetPaymentGateways(exchange.Currency(req.OptionsCurrency))
 	if err != nil {
 		return nil, err
 	}
@@ -131,8 +137,10 @@ type CreatePaymentGatewayOrderReq struct {
 	IdentityAddress string
 	Gateway         string
 	MystAmount      string
+	AmountUSD       string
 	PayCurrency     string
 	Country         string
+	State           string
 	// GatewayCallerData is marshaled json that is accepting by the payment gateway.
 	GatewayCallerData []byte
 }
@@ -145,12 +153,15 @@ func (mb *MobileNode) CreatePaymentGatewayOrder(req *CreatePaymentGatewayOrderRe
 	}
 
 	order, err := mb.pilvytisOrderIssuer.CreatePaymentGatewayOrder(
-		identity.FromAddress(req.IdentityAddress),
-		req.Gateway,
-		req.MystAmount,
-		req.PayCurrency,
-		req.Country,
-		req.GatewayCallerData,
+		pilvytis.GatewayOrderRequest{Identity: identity.FromAddress(req.IdentityAddress),
+			Gateway:     req.Gateway,
+			MystAmount:  req.MystAmount,
+			AmountUSD:   req.AmountUSD,
+			PayCurrency: req.PayCurrency,
+			Country:     req.Country,
+			State:       req.State,
+			CallerData:  req.GatewayCallerData,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -159,6 +170,11 @@ func (mb *MobileNode) CreatePaymentGatewayOrder(req *CreatePaymentGatewayOrderRe
 	res := newPaymentOrderResponse(*order)
 
 	return json.Marshal(res)
+}
+
+// ListOrdersRequest a request to list orders.
+type ListOrdersRequest struct {
+	IdentityAddress string
 }
 
 // ListPaymentGatewayOrders lists all payment orders.
@@ -177,4 +193,54 @@ func (mb *MobileNode) ListPaymentGatewayOrders(req *ListOrdersRequest) ([]byte, 
 	}
 
 	return json.Marshal(orders)
+}
+
+// GatewayClientCallbackReq is the payload for GatewayClientCallback.
+type GatewayClientCallbackReq struct {
+	IdentityAddress     string
+	Gateway             string
+	GooglePurchaseToken string
+	GoogleProductID     string
+}
+
+// GatewayClientCallback triggers payment callback for google from client side.
+func (mb *MobileNode) GatewayClientCallback(req *GatewayClientCallbackReq) error {
+	payload := struct {
+		PurchaseToken   string `json:"purchase_token"`
+		GoogleProductID string `json:"google_product_id"`
+	}{
+		PurchaseToken:   req.GooglePurchaseToken,
+		GoogleProductID: req.GoogleProductID,
+	}
+	return mb.pilvytis.GatewayClientCallback(identity.FromAddress(req.IdentityAddress), req.Gateway, payload)
+}
+
+// OrderUpdatedCallbackPayload is the payload of OrderUpdatedCallback.
+type OrderUpdatedCallbackPayload struct {
+	OrderID     string
+	Status      string
+	PayAmount   string
+	PayCurrency string
+}
+
+// OrderUpdatedCallback is a callback when order status changes.
+type OrderUpdatedCallback interface {
+	OnUpdate(payload *OrderUpdatedCallbackPayload)
+}
+
+// RegisterOrderUpdatedCallback registers OrderStatusChanged callback.
+func (mb *MobileNode) RegisterOrderUpdatedCallback(cb OrderUpdatedCallback) {
+	_ = mb.eventBus.SubscribeAsync(pilvytis.AppTopicOrderUpdated, func(e pilvytis.AppEventOrderUpdated) {
+		payload := OrderUpdatedCallbackPayload{}
+		payload.OrderID = e.ID
+		payload.Status = e.Status.Status()
+		payload.PayAmount = e.PayAmount
+		payload.PayCurrency = e.PayCurrency
+		cb.OnUpdate(&payload)
+	})
+}
+
+// ExchangeRate returns MYST rate in quote currency.
+func (mb *MobileNode) ExchangeRate(quote string) (float64, error) {
+	return mb.pilvytis.GetMystExchangeRateFor(quote)
 }

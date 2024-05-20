@@ -61,3 +61,19 @@ func NewHostFilter() func(*gin.Context) {
 		c.AbortWithStatus(http.StatusForbidden)
 	}
 }
+
+// NewLocalhostOnlyFilter returns instance of middleware allowing only requests
+// with local client IP.
+func NewLocalhostOnlyFilter() func(*gin.Context) {
+	return func(c *gin.Context) {
+
+		// ClientIP() parses the headers defined in Engine.RemoteIPHeaders if there is
+		// so it handles clients behind proxy
+		isLocal := net.ParseIP(c.ClientIP()).IsLoopback()
+		if isLocal {
+			return
+		}
+
+		c.AbortWithStatus(http.StatusForbidden)
+	}
+}

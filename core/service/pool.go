@@ -20,6 +20,7 @@ package service
 import (
 	"sync"
 
+	"github.com/jinzhu/copier"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 
@@ -105,10 +106,16 @@ func (p *Pool) StopAll() error {
 }
 
 // List returns all running service instances.
-func (p *Pool) List() map[ID]*Instance {
+func (p *Pool) List() []*Instance {
 	p.Lock()
 	defer p.Unlock()
-	return p.instances
+
+	list := make([]*Instance, 0, len(p.instances))
+	for _, instance := range p.instances {
+		list = append(list, instance)
+	}
+
+	return list
 }
 
 // Instance returns service instance by the requested id.
@@ -126,32 +133,34 @@ func NewInstance(
 	proposal market.ServiceProposal,
 	state servicestate.State,
 	service Service,
-	policies *policy.Repository,
+	policyProvider policy.Provider,
 	discovery Discovery,
 ) *Instance {
 	return &Instance{
-		ProviderID: providerID,
-		Type:       serviceType,
-		Options:    options,
-		Proposal:   proposal,
-		state:      state,
-		service:    service,
-		policies:   policies,
-		discovery:  discovery,
+		ProviderID:     providerID,
+		Type:           serviceType,
+		Options:        options,
+		Proposal:       proposal,
+		state:          state,
+		service:        service,
+		policyProvider: policyProvider,
+		discovery:      discovery,
 	}
 }
 
 // Instance represents a run service
 type Instance struct {
-	ID              ID
-	state           servicestate.State
-	stateLock       sync.RWMutex
-	ProviderID      identity.Identity
-	Type            string
-	Options         Options
-	service         Service
+	ID         ID
+	state      servicestate.State
+	stateLock  sync.RWMutex
+	ProviderID identity.Identity
+	Type       string
+	Options    Options
+	service    Service
+
+	muProposal      sync.Mutex
 	Proposal        market.ServiceProposal
-	policies        *policy.Repository
+	policyProvider  policy.Provider
 	discovery       Discovery
 	eventPublisher  Publisher
 	p2pChannelsLock sync.Mutex
@@ -164,9 +173,9 @@ func (i *Instance) Service() Service {
 	return i.service
 }
 
-// Policies returns service policies of the running service instance.
-func (i *Instance) Policies() *policy.Repository {
-	return i.policies
+// PolicyProvider returns policy provider implementation.
+func (i *Instance) PolicyProvider() policy.Provider {
+	return i.policyProvider
 }
 
 // State returns the service instance state.
@@ -183,7 +192,9 @@ func (i *Instance) proposalWithCurrentLocation() market.ServiceProposal {
 		return i.Proposal
 	}
 
+	i.muProposal.Lock()
 	i.Proposal.Location = *market.NewLocation(location)
+	i.muProposal.Unlock()
 
 	return i.Proposal
 }
@@ -230,4 +241,21 @@ func (i *Instance) toEvent() servicestate.AppEventServiceStatus {
 		Type:       i.Proposal.ServiceType,
 		Status:     string(i.state),
 	}
+}
+
+// CopyProposal returns a copy of Proposal
+func (i *Instance) CopyProposal() market.ServiceProposal {
+	i.muProposal.Lock()
+	defer i.muProposal.Unlock()
+
+	var proposal market.ServiceProposal
+	if err := copier.CopyWithOption(&proposal, i.Proposal, copier.Option{DeepCopy: true}); err != nil {
+		panic(err)
+	}
+	// workaround b/c of copier bug: it make empty slice instead of nil
+	if i.Proposal.Contacts == nil {
+		proposal.Contacts = nil
+	}
+
+	return proposal
 }

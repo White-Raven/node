@@ -28,7 +28,7 @@ func NewNoOpVersionConfig() (*NoOpVersionConfig, error) {
 
 // Version returns version to be used
 func (vm *NoOpVersionConfig) Version() (string, error) {
-	return "", nil
+	return BundledVersionName, nil
 }
 
 func (vm *NoOpVersionConfig) exists() (bool, error) {
@@ -60,6 +60,6 @@ func (vm *NoOpVersionConfig) uiDir() string {
 	return ""
 }
 
-func (vm *NoOpVersionConfig) write(w nodeUIVersion) {
-	return
+func (vm *NoOpVersionConfig) write(w nodeUIVersion) error {
+	return nil
 }

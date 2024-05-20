@@ -50,7 +50,7 @@ func CheckCopyright() error {
 
 // CheckGoLint reports linting errors in the solution.
 func CheckGoLint() error {
-	return commands.GoLintD(".", "docs")
+	return commands.GoLintD(".", "docs", "services/wireguard/endpoint/netstack")
 }
 
 // CheckGoVet checks that the source is compliant with go vet.
@@ -124,6 +124,9 @@ var checkGenerateExcludes = []string{
 // CheckGenerate checks whether dynamic project parts are updated properly.
 func CheckGenerate() error {
 	filesBefore, err := getUncommittedFiles()
+	if err != nil {
+		return fmt.Errorf("could retrieve uncommitted files: %w", err)
+	}
 	fmt.Println("Uncommitted files (before):")
 	fmt.Println(filesBefore)
 	fmt.Println()

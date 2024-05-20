@@ -18,11 +18,16 @@
 package nat
 
 import (
+	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/utils/cmdutil"
 )
 
 // NewService returns Windows OS specific NAT service based on Internet Connection Sharing (ICS).
 func NewService() NATService {
+	if config.GetBool(config.FlagUserspace) {
+		return &serviceNoop{}
+	}
+
 	return &serviceICS{
 		setICSAddresses: setICSAddresses,
 		powerShell:      cmdutil.PowerShell,

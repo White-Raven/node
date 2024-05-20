@@ -21,9 +21,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/mysteriumnetwork/node/tequilapi/utils"
-
 	"github.com/gin-gonic/gin"
+	"github.com/mysteriumnetwork/go-rest/apierror"
 
 	"github.com/mysteriumnetwork/node/config"
 	"github.com/mysteriumnetwork/node/tequilapi/contract"
@@ -41,14 +40,15 @@ func newTermsAPI(config configProvider) *termsAPI {
 // GetTerms returns current terms config
 //
 // swagger:operation GET /terms Terms getTerms
-// ---
-// summary: Get terms
-// description: Return an object with the current terms config
-// responses:
-//   200:
-//     description: Terms object
-//     schema:
-//       "$ref": "#/definitions/TermsResponse"
+//
+//	---
+//	summary: Get terms
+//	description: Return an object with the current terms config
+//	responses:
+//	  200:
+//	    description: Terms object
+//	    schema:
+//	      "$ref": "#/definitions/TermsResponse"
 func (api *termsAPI) GetTerms(c *gin.Context) {
 	c.JSON(http.StatusOK, contract.NewTermsResp())
 }
@@ -56,34 +56,32 @@ func (api *termsAPI) GetTerms(c *gin.Context) {
 // UpdateTerms accepts new terms and updates user config
 //
 // swagger:operation POST /terms Terms updateTerms
-// ---
-// summary: Update terms agreement
-// description: Takes the given data and tries to update terms agreement config.
-// parameters:
-// - in: body
-//   name: body
-//   description: Required data to update terms
-//   schema:
-//     $ref: "#/definitions/TermsRequest"
-// responses:
-//   200:
-//     description: OK
-//   400:
-//     description: Bad request
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
-//   500:
-//     description: Internal server error
-//     schema:
-//       "$ref": "#/definitions/ErrorMessageDTO"
+//
+//	---
+//	summary: Update terms agreement
+//	description: Takes the given data and tries to update terms agreement config.
+//	parameters:
+//	- in: body
+//	  name: body
+//	  description: Required data to update terms
+//	  schema:
+//	    $ref: "#/definitions/TermsRequest"
+//	responses:
+//	  200:
+//	    description: Terms agreement updated
+//	  400:
+//	    description: Failed to parse or request validation failed
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  500:
+//	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (api *termsAPI) UpdateTerms(c *gin.Context) {
-	r := c.Request
-	w := c.Writer
-
 	var req contract.TermsRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
+	err := json.NewDecoder(c.Request.Body).Decode(&req)
 	if err != nil {
-		utils.SendError(w, err, http.StatusBadRequest)
+		c.Error(apierror.ParseFailed())
 		return
 	}
 
@@ -94,10 +92,10 @@ func (api *termsAPI) UpdateTerms(c *gin.Context) {
 
 	err = api.config.SaveUserConfig()
 	if err != nil {
-		utils.SendError(w, err, http.StatusInternalServerError)
+		c.Error(apierror.Internal("Failed to save config", contract.ErrCodeConfigSave))
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	c.Status(http.StatusOK)
 }
 
 // AddRoutesForTerms registers /terms endpoints in Tequilapi

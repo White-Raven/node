@@ -26,8 +26,6 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/mysteriumnetwork/node/ui/versionmanager"
-
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
@@ -35,8 +33,7 @@ import (
 
 	"github.com/mysteriumnetwork/node/communication/nats"
 	"github.com/mysteriumnetwork/node/config"
-	appconfig "github.com/mysteriumnetwork/node/config"
-	"github.com/mysteriumnetwork/node/consumer/bandwidth"
+	"github.com/mysteriumnetwork/node/consumer/migration"
 	consumer_session "github.com/mysteriumnetwork/node/consumer/session"
 	"github.com/mysteriumnetwork/node/core/auth"
 	"github.com/mysteriumnetwork/node/core/beneficiary"
@@ -46,10 +43,11 @@ import (
 	"github.com/mysteriumnetwork/node/core/discovery/proposal"
 	"github.com/mysteriumnetwork/node/core/ip"
 	"github.com/mysteriumnetwork/node/core/location"
+	"github.com/mysteriumnetwork/node/core/monitoring"
 	"github.com/mysteriumnetwork/node/core/node"
 	nodevent "github.com/mysteriumnetwork/node/core/node/event"
-	"github.com/mysteriumnetwork/node/core/payout"
 	"github.com/mysteriumnetwork/node/core/policy"
+	"github.com/mysteriumnetwork/node/core/policy/localcopy"
 	"github.com/mysteriumnetwork/node/core/port"
 	"github.com/mysteriumnetwork/node/core/quality"
 	"github.com/mysteriumnetwork/node/core/service"
@@ -57,12 +55,12 @@ import (
 	"github.com/mysteriumnetwork/node/core/storage/boltdb"
 	"github.com/mysteriumnetwork/node/core/storage/boltdb/migrations/history"
 	"github.com/mysteriumnetwork/node/core/storage/boltdb/migrator"
+	"github.com/mysteriumnetwork/node/dns"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/feedback"
 	"github.com/mysteriumnetwork/node/firewall"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/identity/registry"
-	identity_registry "github.com/mysteriumnetwork/node/identity/registry"
 	identity_selector "github.com/mysteriumnetwork/node/identity/selector"
 	"github.com/mysteriumnetwork/node/logconfig"
 	"github.com/mysteriumnetwork/node/market/mysterium"
@@ -80,14 +78,17 @@ import (
 	"github.com/mysteriumnetwork/node/router"
 	service_noop "github.com/mysteriumnetwork/node/services/noop"
 	service_openvpn "github.com/mysteriumnetwork/node/services/openvpn"
+	"github.com/mysteriumnetwork/node/services/wireguard/endpoint"
 	"github.com/mysteriumnetwork/node/session/connectivity"
 	"github.com/mysteriumnetwork/node/session/pingpong"
 	"github.com/mysteriumnetwork/node/sleep"
 	"github.com/mysteriumnetwork/node/tequilapi"
+	"github.com/mysteriumnetwork/node/tequilapi/sso"
+	"github.com/mysteriumnetwork/node/ui/versionmanager"
 	"github.com/mysteriumnetwork/node/utils/netutil"
-	"github.com/mysteriumnetwork/payments/client"
 	paymentClient "github.com/mysteriumnetwork/payments/client"
 	psort "github.com/mysteriumnetwork/payments/client/sort"
+	"github.com/mysteriumnetwork/payments/observer"
 )
 
 // UIServer represents our web server
@@ -124,9 +125,10 @@ type Dependencies struct {
 	Keystore         *identity.Keystore
 	IdentityManager  identity.Manager
 	SignerFactory    identity.SignerFactory
-	IdentityRegistry identity_registry.IdentityRegistry
+	IdentityRegistry registry.IdentityRegistry
 	IdentitySelector identity_selector.Handler
 	IdentityMover    *identity.Mover
+	FreeRegistrar    *registry.FreeRegistrar
 
 	DiscoveryFactory    service.DiscoveryFactory
 	ProposalRepository  *discovery.PricedServiceProposalRepository
@@ -138,20 +140,25 @@ type Dependencies struct {
 	IPResolver       ip.Resolver
 	LocationResolver *location.Cache
 
-	PolicyOracle *policy.Oracle
+	dnsProxy *dns.Proxy
+
+	PolicyOracle   *localcopy.Oracle
+	PolicyProvider policy.Provider
 
 	SessionStorage                   *consumer_session.Storage
 	SessionConnectivityStatusStorage connectivity.StatusStorage
 
 	EventBus eventbus.EventBus
 
-	ConnectionManager  connection.Manager
-	ConnectionRegistry *connection.Registry
+	MultiConnectionManager connection.MultiManager
+	ConnectionRegistry     *connection.Registry
 
 	ServicesManager *service.Manager
 	ServiceRegistry *service.Registry
 	ServiceSessions *service.SessionPool
 	ServiceFirewall firewall.IncomingTrafficFirewall
+
+	WireguardClientFactory *endpoint.WgClientFactory
 
 	PortPool   *port.Pool
 	PortMapper mapping.PortMapper
@@ -161,12 +168,13 @@ type Dependencies struct {
 	P2PDialer   p2p.Dialer
 	P2PListener p2p.Listener
 
-	Authenticator     *auth.Authenticator
-	JWTAuthenticator  *auth.JWTAuthenticator
-	UIServer          UIServer
-	Transactor        *registry.Transactor
-	BCHelper          *paymentClient.MultichainBlockchainClient
-	ProviderRegistrar *registry.ProviderRegistrar
+	Authenticator    *auth.Authenticator
+	JWTAuthenticator *auth.JWTAuthenticator
+	UIServer         UIServer
+	Transactor       *registry.Transactor
+	Affiliator       *registry.Affiliator
+	BCHelper         *paymentClient.MultichainBlockchainClient
+	SSOMystnodes     *sso.Mystnodes
 
 	LogCollector *logconfig.Collector
 	Reporter     *feedback.Reporter
@@ -184,8 +192,9 @@ type Dependencies struct {
 	HermesCaller             *pingpong.HermesCaller
 	HermesPromiseHandler     *pingpong.HermesPromiseHandler
 	SettlementHistoryStorage *pingpong.SettlementHistoryStorage
-	AddressProvider          *pingpong.AddressProvider
+	AddressProvider          *paymentClient.MultiChainAddressProvider
 	HermesStatusChecker      *pingpong.HermesStatusChecker
+	HermesMigrator           *migration.HermesMigrator
 
 	MMN *mmn.MMN
 
@@ -193,11 +202,14 @@ type Dependencies struct {
 	PilvytisTracker     *pilvytis.StatusTracker
 	PilvytisOrderIssuer *pilvytis.OrderIssuer
 
+	ObserverAPI *observer.API
+
 	ResidentCountry *identity.ResidentCountry
 
-	PayoutAddressStorage *payout.AddressStorage
-	NodeStatusTracker    *node.MonitoringStatusTracker
-	uiVersionConfig      versionmanager.NodeUIVersionConfig
+	BeneficiaryAddressStorage beneficiary.BeneficiaryStorage
+	NodeStatusTracker         *monitoring.StatusTracker
+	NodeStatsTracker          *node.StatsTracker
+	uiVersionConfig           versionmanager.NodeUIVersionConfig
 }
 
 // Bootstrap initiates all container dependencies
@@ -225,8 +237,6 @@ func (di *Dependencies) Bootstrap(nodeOptions node.Options) error {
 	}
 
 	di.bootstrapEventBus()
-
-	di.bootstrapAddressProvider(nodeOptions)
 
 	if err := di.bootstrapStorage(nodeOptions.Directories.Storage); err != nil {
 		return err
@@ -293,7 +303,7 @@ func (di *Dependencies) Bootstrap(nodeOptions node.Options) error {
 		return err
 	}
 
-	appconfig.Current.EnableEventPublishing(di.EventBus)
+	config.Current.EnableEventPublishing(di.EventBus)
 
 	di.handleNATStatusForPublicIP()
 
@@ -304,23 +314,40 @@ func (di *Dependencies) Bootstrap(nodeOptions node.Options) error {
 func (di *Dependencies) bootstrapAddressProvider(nodeOptions node.Options) {
 	ch1 := nodeOptions.Chains.Chain1
 	ch2 := nodeOptions.Chains.Chain2
-	addresses := map[int64]client.SmartContractAddresses{
+	chain1KnownHermeses := parseAddressSlice(ch1.KnownHermeses)
+	chain2KnownHermeses := parseAddressSlice(ch2.KnownHermeses)
+	hermesAddresses, err := di.ObserverAPI.GetApprovedHermesAdresses()
+	if err != nil {
+		log.Warn().AnErr("err", err).Msg("observer hermeses call failed, using fallback known hermeses")
+	} else {
+		chain1ApprovedHermeses, ok := hermesAddresses[ch1.ChainID]
+		if ok {
+			chain1KnownHermeses = chain1ApprovedHermeses
+		}
+		chain2ApprovedHermeses, ok := hermesAddresses[ch2.ChainID]
+		if ok {
+			chain2KnownHermeses = chain2ApprovedHermeses
+		}
+	}
+	addresses := map[int64]paymentClient.SmartContractAddresses{
 		ch1.ChainID: {
-			Registry:              common.HexToAddress(ch1.RegistryAddress),
-			Myst:                  common.HexToAddress(ch1.MystAddress),
-			Hermes:                common.HexToAddress(ch1.HermesID),
-			ChannelImplementation: common.HexToAddress(ch1.ChannelImplAddress),
+			Registry:                    common.HexToAddress(ch1.RegistryAddress),
+			Myst:                        common.HexToAddress(ch1.MystAddress),
+			ActiveHermes:                common.HexToAddress(ch1.HermesID),
+			ActiveChannelImplementation: common.HexToAddress(ch1.ChannelImplAddress),
+			KnownHermeses:               chain1KnownHermeses,
 		},
 		ch2.ChainID: {
-			Registry:              common.HexToAddress(ch2.RegistryAddress),
-			Myst:                  common.HexToAddress(ch2.MystAddress),
-			Hermes:                common.HexToAddress(ch2.HermesID),
-			ChannelImplementation: common.HexToAddress(ch2.ChannelImplAddress),
+			Registry:                    common.HexToAddress(ch2.RegistryAddress),
+			Myst:                        common.HexToAddress(ch2.MystAddress),
+			ActiveHermes:                common.HexToAddress(ch2.HermesID),
+			ActiveChannelImplementation: common.HexToAddress(ch2.ChannelImplAddress),
+			KnownHermeses:               chain2KnownHermeses,
 		},
 	}
 
-	keeper := client.NewMultiChainAddressKeeper(addresses)
-	di.AddressProvider = pingpong.NewAddressProvider(keeper)
+	keeper := paymentClient.NewMultiChainAddressKeeper(addresses)
+	di.AddressProvider = paymentClient.NewMultiChainAddressProvider(keeper, di.BCHelper)
 }
 
 func (di *Dependencies) bootstrapP2P() {
@@ -358,7 +385,11 @@ func (di *Dependencies) bootstrapStateKeeper(options node.Options) error {
 	}
 
 	di.StateKeeper = state.NewKeeper(deps, state.DefaultDebounceDuration)
-	return di.StateKeeper.Subscribe(di.EventBus)
+	if options.SSE.Enabled {
+		return di.StateKeeper.Subscribe(di.EventBus)
+	}
+
+	return nil
 }
 
 func (di *Dependencies) registerOpenvpnConnection(nodeOptions node.Options) {
@@ -476,7 +507,7 @@ func (di *Dependencies) bootstrapStorage(path string) error {
 
 	invoiceStorage := pingpong.NewInvoiceStorage(di.Storage)
 	di.ProviderInvoiceStorage = pingpong.NewProviderInvoiceStorage(invoiceStorage)
-	di.ConsumerTotalsStorage = pingpong.NewConsumerTotalsStorage(di.Storage, di.EventBus)
+	di.ConsumerTotalsStorage = pingpong.NewConsumerTotalsStorage(di.EventBus)
 	di.HermesPromiseStorage = pingpong.NewHermesPromiseStorage(di.Storage)
 	di.SessionStorage = consumer_session.NewSessionStorage(di.Storage)
 	di.SettlementHistoryStorage = pingpong.NewSettlementHistoryStorage(di.Storage)
@@ -498,16 +529,6 @@ func (di *Dependencies) getHermesURL(nodeOptions node.Options) (string, error) {
 }
 
 func (di *Dependencies) bootstrapNodeComponents(nodeOptions node.Options, tequilaListener net.Listener) error {
-	// Consumer current session bandwidth
-	bandwidthTracker := bandwidth.NewTracker(di.EventBus)
-	if err := bandwidthTracker.Subscribe(di.EventBus); err != nil {
-		return err
-	}
-
-	if err := di.bootstrapProviderRegistrar(nodeOptions); err != nil {
-		return err
-	}
-
 	di.ConsumerBalanceTracker = pingpong.NewConsumerBalanceTracker(
 		di.EventBus,
 		di.BCHelper,
@@ -516,6 +537,7 @@ func (di *Dependencies) bootstrapNodeComponents(nodeOptions node.Options, tequil
 		di.Transactor,
 		di.IdentityRegistry,
 		di.AddressProvider,
+		di.BCHelper,
 		pingpong.ConsumerBalanceTrackerConfig{
 			FastSync: pingpong.PollConfig{
 				Interval: nodeOptions.Payments.BalanceFastPollInterval,
@@ -532,7 +554,7 @@ func (di *Dependencies) bootstrapNodeComponents(nodeOptions node.Options, tequil
 		return errors.Wrap(err, "could not subscribe consumer balance tracker to relevant events")
 	}
 
-	di.PayoutAddressStorage = payout.NewAddressStorage(di.Storage)
+	di.BeneficiaryAddressStorage = beneficiary.NewAddressStorage(di.Storage)
 	di.bootstrapBeneficiaryProvider(nodeOptions)
 
 	di.HermesPromiseHandler = pingpong.NewHermesPromiseHandler(pingpong.HermesPromiseHandlerDeps{
@@ -545,6 +567,7 @@ func (di *Dependencies) bootstrapNodeComponents(nodeOptions node.Options, tequil
 		Encryption:      di.Keystore,
 		EventBus:        di.EventBus,
 		Signer:          di.SignerFactory,
+		Chains:          []int64{nodeOptions.Chains.Chain1.ChainID, nodeOptions.Chains.Chain2.ChainID},
 	})
 
 	if err := di.HermesPromiseHandler.Subscribe(di.EventBus); err != nil {
@@ -558,31 +581,33 @@ func (di *Dependencies) bootstrapNodeComponents(nodeOptions node.Options, tequil
 	di.bootstrapBeneficiarySaver(nodeOptions)
 
 	di.ConnectionRegistry = connection.NewRegistry()
-	di.ConnectionManager = connection.NewManager(
-		pingpong.ExchangeFactoryFunc(
-			di.Keystore,
-			di.SignerFactory,
-			di.ConsumerTotalsStorage,
-			di.AddressProvider,
+	di.MultiConnectionManager = connection.NewMultiConnectionManager(func() connection.Manager {
+		return connection.NewManager(
+			pingpong.ExchangeFactoryFunc(
+				di.Keystore,
+				di.SignerFactory,
+				di.ConsumerTotalsStorage,
+				di.AddressProvider,
+				di.EventBus,
+				nodeOptions.Payments.ConsumerDataLeewayMegabytes,
+			),
+			di.ConnectionRegistry.CreateConnection,
 			di.EventBus,
-			nodeOptions.Payments.ConsumerDataLeewayMegabytes,
-		),
-		di.ConnectionRegistry.CreateConnection,
-		di.EventBus,
-		di.IPResolver,
-		di.LocationResolver,
-		connection.DefaultConfig(),
-		connection.DefaultStatsReportInterval,
-		connection.NewValidator(
-			di.ConsumerBalanceTracker,
-			di.IdentityManager,
-		),
-		di.P2PDialer,
-		di.allowTrustedDomainBypassTunnel,
-		di.disallowTrustedDomainBypassTunnel,
-	)
+			di.IPResolver,
+			di.LocationResolver,
+			connection.DefaultConfig(),
+			config.GetDuration(config.FlagStatsReportInterval),
+			connection.NewValidator(
+				di.ConsumerBalanceTracker,
+				di.IdentityManager,
+			),
+			di.P2PDialer,
+			di.allowTrustedDomainBypassTunnel,
+			di.disallowTrustedDomainBypassTunnel,
+		)
+	})
 
-	di.NATProber = natprobe.NewNATProber(di.ConnectionManager, di.EventBus)
+	di.NATProber = natprobe.NewNATProber(di.MultiConnectionManager, di.EventBus)
 
 	di.LogCollector = logconfig.NewCollector(&logconfig.CurrentLogOptions)
 	reporter, err := feedback.NewReporter(di.LogCollector, di.IdentityManager, di.LocationResolver, nodeOptions.FeedbackURL)
@@ -597,27 +622,40 @@ func (di *Dependencies) bootstrapNodeComponents(nodeOptions node.Options, tequil
 
 	di.bootstrapPilvytis(nodeOptions)
 
-	sessionProviderFunc := func(providerID string) (results []node.Session) {
-		for _, session := range di.QualityClient.ProviderSessions(providerID) {
-			results = append(results, node.Session{ProviderID: session.ProposalID.ProviderID, MonitoringFailed: session.MonitoringFailed, ServiceType: session.ProposalID.ServiceType})
-		}
-		return results
-	}
+	di.NodeStatusTracker = monitoring.NewStatusTracker(
+		di.IdentityManager,
+		di.QualityClient,
+	)
 
-	di.NodeStatusTracker = node.NewMonitoringStatusTracker(
-		sessionProviderFunc,
+	di.NodeStatsTracker = node.NewNodeStatsTracker(
+		di.QualityClient.ProviderStatuses,
+		di.QualityClient.ProviderSessionsList,
+		di.QualityClient.ProviderTransferredData,
+		di.QualityClient.ProviderSessionsCount,
+		di.QualityClient.ProviderConsumersCount,
+		di.QualityClient.ProviderEarningsSeries,
+		di.QualityClient.ProviderSessionsSeries,
+		di.QualityClient.ProviderTransferredDataSeries,
+		di.QualityClient.ProviderActivityStats,
+		di.QualityClient.ProviderQuality,
+		di.QualityClient.ProviderServiceEarnings,
 		di.IdentityManager,
 	)
+
+	di.HermesMigrator = di.bootstrapHermesMigrator()
+	if err := di.HermesMigrator.Subscribe(di.EventBus); err != nil {
+		return fmt.Errorf("error during subscribe: %w", err)
+	}
 
 	tequilapiHTTPServer, err := di.bootstrapTequilapi(nodeOptions, tequilaListener)
 	if err != nil {
 		return err
 	}
 
-	sleepNotifier := sleep.NewNotifier(di.ConnectionManager, di.EventBus)
+	sleepNotifier := sleep.NewNotifier(di.MultiConnectionManager, di.EventBus)
 	sleepNotifier.Subscribe()
 
-	di.Node = NewNode(di.ConnectionManager, tequilapiHTTPServer, di.EventBus, di.UIServer, sleepNotifier)
+	di.Node = NewNode(di.MultiConnectionManager, tequilapiHTTPServer, di.EventBus, di.UIServer, sleepNotifier)
 
 	return nil
 }
@@ -628,15 +666,17 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	network := metadata.DefaultNetwork
 
 	switch {
-	case optionsNetwork.Mainnet:
+	case optionsNetwork.Network.IsMainnet():
 		network = metadata.MainnetDefinition
-	case optionsNetwork.Localnet:
+	case optionsNetwork.Network.IsLocalnet():
 		network = metadata.LocalnetDefinition
+	case optionsNetwork.Network.IsTestnet():
+		network = metadata.TestnetDefinition
 	}
 
 	// override defined values one by one from options
-	if optionsNetwork.MysteriumAPIAddress != metadata.DefaultNetwork.MysteriumAPIAddress {
-		network.MysteriumAPIAddress = optionsNetwork.MysteriumAPIAddress
+	if optionsNetwork.DiscoveryAddress != metadata.DefaultNetwork.DiscoveryAddress {
+		network.DiscoveryAddress = optionsNetwork.DiscoveryAddress
 	}
 
 	if !reflect.DeepEqual(optionsNetwork.BrokerAddresses, metadata.DefaultNetwork.BrokerAddresses) {
@@ -665,7 +705,7 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	dialer.ResolveContext = resolver
 	di.HTTPTransport = requests.NewTransport(dialer.DialContext)
 	di.HTTPClient = requests.NewHTTPClientWithTransport(di.HTTPTransport, requests.DefaultTimeout)
-	di.MysteriumAPI = mysterium.NewClient(di.HTTPClient, network.MysteriumAPIAddress)
+	di.MysteriumAPI = mysterium.NewClient(di.HTTPClient, network.DiscoveryAddress)
 	di.PricingHelper = pingpong.NewPricer(di.MysteriumAPI)
 	err = di.PricingHelper.Subscribe(di.EventBus)
 	if err != nil {
@@ -692,7 +732,7 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	di.EtherClients = make([]*paymentClient.ReconnectableEthClient, 0)
 	bcClientsL1 := make([]paymentClient.AddressableEthClientGetter, 0)
 	for _, rpc := range network.Chain1.EtherClientRPC {
-		client, err := paymentClient.NewReconnectableEthClient(rpc, time.Second*30)
+		client, err := paymentClient.NewReconnectableEthClient(rpc, time.Second*10)
 		if err != nil {
 			log.Warn().Msgf("failed to load rpc endpoint: %s", rpc)
 			continue
@@ -702,12 +742,12 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	}
 
 	if len(bcClientsL1) == 0 {
-		return errors.New("no l1 rpc endpoints loaded, can't continue")
+		log.Error().Msg("no l1 rpc endpoints loaded")
 	}
 
 	bcClientsL2 := make([]paymentClient.AddressableEthClientGetter, 0)
 	for _, rpc := range network.Chain2.EtherClientRPC {
-		client, err := paymentClient.NewReconnectableEthClient(rpc, time.Second*30)
+		client, err := paymentClient.NewReconnectableEthClient(rpc, time.Second*10)
 		if err != nil {
 			log.Warn().Msgf("failed to load rpc endpoint: %s", rpc)
 			continue
@@ -718,7 +758,7 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	}
 
 	if len(bcClientsL2) == 0 {
-		return errors.New("no l2 rpc endpoints loaded, can't continue")
+		log.Error().Msg("no l1 rpc endpoints loaded")
 	}
 
 	notifyChannelL1 := make(chan paymentClient.Notification, 5)
@@ -747,7 +787,9 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	clients[options.Chains.Chain2.ChainID] = bcL2
 
 	di.BCHelper = paymentClient.NewMultichainBlockchainClient(clients)
-	di.HermesURLGetter = pingpong.NewHermesURLGetter(di.BCHelper, di.AddressProvider)
+	di.ObserverAPI = observer.NewAPI(options.ObserverAddress, time.Second*30)
+	di.bootstrapAddressProvider(options)
+	di.HermesURLGetter = pingpong.NewHermesURLGetter(di.BCHelper, di.AddressProvider, di.ObserverAPI)
 
 	registryStorage := registry.NewRegistrationStatusStorage(di.Storage)
 
@@ -760,6 +802,11 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	di.SignerFactory = func(id identity.Identity) identity.Signer {
 		return identity.NewSigner(di.Keystore, id)
 	}
+
+	if err := di.bootstrapSSOMystnodes(); err != nil {
+		return err
+	}
+
 	di.Transactor = registry.NewTransactor(
 		di.HTTPClient,
 		options.Transactor.TransactorEndpointAddress,
@@ -767,20 +814,23 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 		di.SignerFactory,
 		di.EventBus,
 		di.BCHelper,
+		options.Transactor.TransactorFeesValidTime,
 	)
+	di.Affiliator = registry.NewAffiliator(di.HTTPClient, options.Affiliator.AffiliatorEndpointAddress)
 
 	registryCfg := registry.IdentityRegistryConfig{
 		TransactorPollInterval: options.Payments.RegistryTransactorPollInterval,
 		TransactorPollTimeout:  options.Payments.RegistryTransactorPollTimeout,
 	}
 
-	if di.IdentityRegistry, err = identity_registry.NewIdentityRegistryContract(di.EtherClientL2, di.AddressProvider, registryStorage, di.EventBus, di.HermesCaller, di.Transactor, registryCfg); err != nil {
+	if di.IdentityRegistry, err = registry.NewIdentityRegistryContract(di.EtherClientL2, di.AddressProvider, registryStorage, di.EventBus, di.HermesCaller, di.Transactor, di.IdentitySelector, registryCfg); err != nil {
 		return err
 	}
 
 	allow := []string{
-		network.MysteriumAPIAddress,
+		network.DiscoveryAddress,
 		options.Transactor.TransactorEndpointAddress,
+		options.Affiliator.AffiliatorEndpointAddress,
 		hermesURL,
 		options.PilvytisAddress,
 	}
@@ -790,6 +840,9 @@ func (di *Dependencies) bootstrapNetworkComponents(options node.Options) (err er
 	if err := di.AllowURLAccess(allow...); err != nil {
 		return err
 	}
+
+	di.WireguardClientFactory = endpoint.NewWGClientFactory()
+
 	return di.IdentityRegistry.Subscribe(di.EventBus)
 }
 
@@ -822,6 +875,11 @@ func (di *Dependencies) bootstrapIdentityComponents(options node.Options) error 
 		di.Keystore,
 		di.EventBus,
 		di.SignerFactory)
+
+	di.FreeRegistrar = registry.NewFreeRegistrar(di.IdentitySelector, di.Transactor, di.IdentityRegistry, options.Transactor.TryFreeRegistration)
+	if err := di.FreeRegistrar.Subscribe(di.EventBus); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -831,7 +889,7 @@ func (di *Dependencies) bootstrapQualityComponents(options node.OptionsQuality) 
 	}
 
 	di.QualityClient = quality.NewMorqaClient(
-		requests.NewHTTPClientWithTransport(di.HTTPTransport, 10*time.Second),
+		requests.NewHTTPClientWithTransport(di.HTTPTransport, 60*time.Second),
 		options.Address,
 		di.SignerFactory,
 	)
@@ -899,9 +957,11 @@ func (di *Dependencies) bootstrapLocationComponents(options node.Options) (err e
 
 	di.LocationResolver = location.NewCache(resolver, di.EventBus, time.Minute*5)
 
-	err = di.EventBus.SubscribeAsync(connectionstate.AppTopicConnectionState, di.LocationResolver.HandleConnectionEvent)
-	if err != nil {
-		return err
+	if !config.GetBool(config.FlagProxyMode) && !config.GetBool(config.FlagDVPNMode) {
+		err = di.EventBus.SubscribeAsync(connectionstate.AppTopicConnectionState, di.LocationResolver.HandleConnectionEvent)
+		if err != nil {
+			return err
+		}
 	}
 
 	err = di.EventBus.SubscribeAsync(nodevent.AppTopicNode, di.LocationResolver.HandleNodeEvent)
@@ -925,7 +985,7 @@ func (di *Dependencies) bootstrapAuthenticator() error {
 
 func (di *Dependencies) bootstrapPilvytis(options node.Options) {
 	di.PilvytisAPI = pilvytis.NewAPI(di.HTTPClient, options.PilvytisAddress, di.SignerFactory, di.LocationResolver, di.AddressProvider)
-	di.PilvytisTracker = pilvytis.NewStatusTracker(di.PilvytisAPI, di.IdentityManager, di.EventBus, 30*time.Second)
+	di.PilvytisTracker = pilvytis.NewStatusTracker(di.PilvytisAPI, di.IdentityManager, di.EventBus, time.Minute)
 	di.PilvytisOrderIssuer = pilvytis.NewOrderIssuer(di.PilvytisAPI, di.PilvytisTracker)
 
 	go di.PilvytisTracker.Track()
@@ -976,6 +1036,28 @@ func (di *Dependencies) bootstrapBeneficiarySaver(options node.Options) {
 	)
 }
 
+func (di *Dependencies) bootstrapHermesMigrator() *migration.HermesMigrator {
+	return migration.NewHermesMigrator(
+		di.Transactor,
+		di.AddressProvider,
+		di.HermesURLGetter,
+		func(hermesURL string) pingpong.HermesHTTPRequester {
+			return pingpong.NewHermesCaller(di.HTTPClient, hermesURL)
+		},
+		di.HermesPromiseSettler,
+		di.IdentityRegistry,
+		di.ConsumerBalanceTracker,
+		migration.NewStorage(di.Storage, di.AddressProvider),
+		di.BCHelper,
+	)
+}
+
+func (di *Dependencies) bootstrapSSOMystnodes() error {
+	s := sso.NewMystnodes(di.SignerFactory, di.HTTPClient)
+	di.SSOMystnodes = s
+	return s.Subscribe(di.EventBus)
+}
+
 func (di *Dependencies) handleConnStateChange() error {
 	if di.HTTPClient == nil {
 		return errors.New("HTTPClient is not initialized")
@@ -983,6 +1065,10 @@ func (di *Dependencies) handleConnStateChange() error {
 
 	latestState := connectionstate.NotConnected
 	return di.EventBus.SubscribeAsync(connectionstate.AppTopicConnectionState, func(e connectionstate.AppEventConnectionState) {
+		if config.GetBool(config.FlagProxyMode) || config.GetBool(config.FlagDVPNMode) {
+			return // Proxy mode doesn't establish system wide tunnels, no reconnect required.
+		}
+
 		// Here we care only about connected and disconnected events.
 		if e.State != connectionstate.Connected && e.State != connectionstate.NotConnected {
 			return
@@ -1071,7 +1157,7 @@ func getUDPListenPorts() (port.Range, error) {
 }
 
 func (di *Dependencies) allowTrustedDomainBypassTunnel() {
-	allow := []string{di.NetworkDefinition.MysteriumAPIAddress}
+	allow := []string{di.NetworkDefinition.DiscoveryAddress}
 	allow = append(allow, di.NetworkDefinition.BrokerAddresses...)
 
 	if err := router.ExcludeURL(allow...); err != nil {
@@ -1080,10 +1166,18 @@ func (di *Dependencies) allowTrustedDomainBypassTunnel() {
 }
 
 func (di *Dependencies) disallowTrustedDomainBypassTunnel() {
-	allow := []string{di.NetworkDefinition.MysteriumAPIAddress}
+	allow := []string{di.NetworkDefinition.DiscoveryAddress}
 	allow = append(allow, di.NetworkDefinition.BrokerAddresses...)
 
 	if err := router.RemoveExcludedURL(allow...); err != nil {
 		log.Error().Err(err).Msgf("Failed to remove excluded routes for trusted domains: %v", allow)
 	}
+}
+
+func parseAddressSlice(slice []string) []common.Address {
+	res := make([]common.Address, len(slice))
+	for i, s := range slice {
+		res[i] = common.HexToAddress(s)
+	}
+	return res
 }

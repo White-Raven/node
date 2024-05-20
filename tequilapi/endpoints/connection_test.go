@@ -27,14 +27,15 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/mysteriumnetwork/go-rest/apierror"
 	"github.com/mysteriumnetwork/node/consumer/bandwidth"
 	"github.com/mysteriumnetwork/node/core/connection"
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/core/discovery/proposal"
+	"github.com/mysteriumnetwork/node/core/state/event"
 	"github.com/mysteriumnetwork/node/datasize"
 	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
@@ -68,11 +69,15 @@ func (cm *mockConnectionManager) Connect(consumerID identity.Identity, hermesID 
 	return cm.onConnectReturn
 }
 
-func (cm *mockConnectionManager) Status() connectionstate.Status {
+func (cm *mockConnectionManager) Status(int) connectionstate.Status {
 	return cm.onStatusReturn
 }
 
-func (cm *mockConnectionManager) Disconnect() error {
+func (cm *mockConnectionManager) Stats(int) connectionstate.Statistics {
+	return connectionstate.Statistics{}
+}
+
+func (cm *mockConnectionManager) Disconnect(int) error {
 	cm.disconnectCount++
 	return cm.onDisconnectReturn
 }
@@ -81,7 +86,7 @@ func (cm *mockConnectionManager) CheckChannel(context.Context) error {
 	return cm.onCheckChannelReturn
 }
 
-func (cm *mockConnectionManager) Reconnect() {
+func (cm *mockConnectionManager) Reconnect(int) {
 	return
 }
 
@@ -100,14 +105,16 @@ func mockRepositoryWithProposal(providerID, serviceType string) *mockProposalRep
 }
 
 func TestAddRoutesForConnectionAddsRoutes(t *testing.T) {
-	router := gin.Default()
+	router := summonTestGin()
 	state := connectionstate.Status{State: connectionstate.NotConnected}
 	fakeManager := &mockConnectionManager{
 		onStatusReturn: state,
 	}
-	fakeState := &mockStateProvider{}
-	fakeState.stateToReturn.Connection.Session = state
-	fakeState.stateToReturn.Connection.Statistics = connectionstate.Statistics{BytesSent: 1, BytesReceived: 2}
+	fakeState := &mockStateProvider{stateToReturn: event.State{Connections: make(map[string]event.Connection)}}
+	fakeState.stateToReturn.Connections["1"] = event.Connection{
+		Session:    state,
+		Statistics: connectionstate.Statistics{BytesSent: 1, BytesReceived: 2},
+	}
 
 	mockedProposalProvider := mockRepositoryWithProposal("node1", "noop")
 	err := AddRoutesForConnection(fakeManager, fakeState, mockedProposalProvider, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(router)
@@ -140,7 +147,12 @@ func TestAddRoutesForConnectionAddsRoutes(t *testing.T) {
 				"throughput_received": 0,
 				"throughput_sent": 0,
 				"duration": 0,
-				"tokens_spent": 0
+				"tokens_spent": 0,
+				"spent_tokens": {
+					"ether": "0",
+					"human": "0",
+					"wei": "0"
+				}
 			}`,
 		},
 	}
@@ -170,7 +182,7 @@ func TestStateIsReturnedFromStore(t *testing.T) {
 		},
 	}
 
-	router := gin.Default()
+	router := summonTestGin()
 	err := AddRoutesForConnection(manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(router)
 	assert.NoError(t, err)
 
@@ -193,7 +205,7 @@ func TestStateIsReturnedFromStore(t *testing.T) {
 func TestPutReturns400ErrorIfRequestBodyIsNotJSON(t *testing.T) {
 	fakeManager := mockConnectionManager{}
 
-	router := gin.Default()
+	router := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(router)
 	assert.NoError(t, err)
 
@@ -202,19 +214,13 @@ func TestPutReturns400ErrorIfRequestBodyIsNotJSON(t *testing.T) {
 
 	router.ServeHTTP(resp, req)
 	assert.Equal(t, http.StatusBadRequest, resp.Code)
-
-	assert.JSONEq(
-		t,
-		`{
-			"message" : "invalid character 'a' looking for beginning of value"
-		}`,
-		resp.Body.String())
+	assert.Equal(t, "parse_failed", apierror.Parse(resp.Result()).Err.Code)
 }
 
 func TestPutReturns422ErrorIfRequestBodyIsMissingFieldValues(t *testing.T) {
 	fakeManager := mockConnectionManager{}
 
-	router := gin.Default()
+	router := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(router)
 	assert.NoError(t, err)
 
@@ -223,16 +229,11 @@ func TestPutReturns422ErrorIfRequestBodyIsMissingFieldValues(t *testing.T) {
 
 	router.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
-
-	assert.JSONEq(
-		t,
-		`{
-			"message" : "validation_error",
-			"errors" : {
-				"consumer_id" : [ { "code" : "required" , "message" : "Field is required" } ]
-			}
-		}`, resp.Body.String())
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	apiErr := apierror.Parse(resp.Result())
+	assert.Equal(t, "validation_failed", apiErr.Err.Code)
+	assert.Contains(t, apiErr.Err.Fields, "consumer_id")
+	assert.Equal(t, "required", apiErr.Err.Fields["consumer_id"].Code)
 }
 
 func TestPutWithValidBodyCreatesConnection(t *testing.T) {
@@ -241,8 +242,10 @@ func TestPutWithValidBodyCreatesConnection(t *testing.T) {
 		SessionID: "1",
 	}
 	fakeManager := mockConnectionManager{onStatusReturn: state}
-	fakeState := &mockStateProvider{}
-	fakeState.stateToReturn.Connection.Session = state
+	fakeState := &mockStateProvider{stateToReturn: event.State{Connections: make(map[string]event.Connection)}}
+	fakeState.stateToReturn.Connections["1"] = event.Connection{
+		Session: state,
+	}
 
 	proposalProvider := mockRepositoryWithProposal("required-node", "openvpn")
 	req := httptest.NewRequest(
@@ -256,7 +259,7 @@ func TestPutWithValidBodyCreatesConnection(t *testing.T) {
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, fakeState, proposalProvider, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
@@ -296,18 +299,14 @@ func TestPutUnregisteredIdentityReturnsError(t *testing.T) {
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, &mockStateProvider{}, proposalProvider, &mir, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusExpectationFailed, resp.Code)
-	assert.JSONEq(
-		t,
-		`{"message":"identity \"my-identity\" is not registered. Please register the identity first"}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
+	assert.Equal(t, "err_id_not_registered", apierror.Parse(resp.Result()).Err.Code)
 }
 
 func TestPutFailedRegistrationCheckReturnsError(t *testing.T) {
@@ -328,18 +327,16 @@ func TestPutFailedRegistrationCheckReturnsError(t *testing.T) {
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, &mockStateProvider{}, proposalProvider, &mir, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusInternalServerError, resp.Code)
-	assert.JSONEq(
-		t,
-		`{"message":"explosions everywhere"}`,
-		resp.Body.String(),
-	)
+	apiErr := apierror.Parse(resp.Result())
+	assert.Equal(t, "err_id_registration_status_check", apiErr.Err.Code)
+	assert.Equal(t, "Failed to check ID registration status: explosions everywhere", apiErr.Message())
 }
 
 func TestPutWithServiceTypeOverridesDefault(t *testing.T) {
@@ -358,7 +355,7 @@ func TestPutWithServiceTypeOverridesDefault(t *testing.T) {
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, &mockStateProvider{}, mystAPI, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
@@ -378,7 +375,7 @@ func TestDeleteCallsDisconnect(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "/connection", nil)
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&fakeManager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
@@ -390,10 +387,12 @@ func TestDeleteCallsDisconnect(t *testing.T) {
 }
 
 func TestGetStatisticsEndpointReturnsStatistics(t *testing.T) {
-	fakeState := &mockStateProvider{}
-	fakeState.stateToReturn.Connection.Statistics = connectionstate.Statistics{BytesSent: 1, BytesReceived: 2}
-	fakeState.stateToReturn.Connection.Throughput = bandwidth.Throughput{Up: datasize.BitSpeed(1000), Down: datasize.BitSpeed(2000)}
-	fakeState.stateToReturn.Connection.Invoice = crypto.Invoice{AgreementTotal: big.NewInt(10001)}
+	fakeState := &mockStateProvider{stateToReturn: event.State{Connections: make(map[string]event.Connection)}}
+	fakeState.stateToReturn.Connections["1"] = event.Connection{
+		Statistics: connectionstate.Statistics{BytesSent: 1, BytesReceived: 2},
+		Throughput: bandwidth.Throughput{Up: datasize.BitSpeed(1000), Down: datasize.BitSpeed(2000)},
+		Invoice:    crypto.Invoice{AgreementTotal: big.NewInt(10001)},
+	}
 
 	manager := mockConnectionManager{}
 
@@ -410,7 +409,7 @@ func TestGetStatisticsEndpointReturnsStatistics(t *testing.T) {
 				"service_type": "noop"
 			}`))
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&manager, fakeState, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
@@ -424,7 +423,12 @@ func TestGetStatisticsEndpointReturnsStatistics(t *testing.T) {
 			"throughput_sent": 1000,
 			"throughput_received": 2000,
 			"duration": 0,
-			"tokens_spent": 10001
+			"tokens_spent": 10001,
+			"spent_tokens": {
+				"ether": "0.000000000000010001",
+				"human": "0",
+				"wei": "10001"
+			}
 		}`,
 		resp.Body.String(),
 	)
@@ -447,20 +451,14 @@ func TestEndpointReturnsConflictStatusIfConnectionAlreadyExists(t *testing.T) {
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&manager, nil, mystAPI, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, http.StatusConflict, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message" : "connection already exists"
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
+	assert.Equal(t, "err_connection_already_exists", apierror.Parse(resp.Result()).Err.Code)
 }
 
 /*func TestDisconnectReturnsConflictStatusIfConnectionDoesNotExist(t *testing.T) {
@@ -504,20 +502,14 @@ func TestConnectReturnsConnectCancelledStatusWhenErrConnectionCancelledIsEncount
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&manager, nil, mockProposalProvider, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
 	g.ServeHTTP(resp, req)
 
-	assert.Equal(t, statusConnectCancelled, resp.Code)
-	assert.JSONEq(
-		t,
-		`{
-			"message" : "connection was cancelled"
-		}`,
-		resp.Body.String(),
-	)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code)
+	assert.Equal(t, "err_connection_cancelled", apierror.Parse(resp.Result()).Err.Code)
 }
 
 func TestConnectReturnsErrorIfNoProposals(t *testing.T) {
@@ -535,7 +527,7 @@ func TestConnectReturnsErrorIfNoProposals(t *testing.T) {
 			}`))
 	resp := httptest.NewRecorder()
 
-	g := gin.Default()
+	g := summonTestGin()
 	err := AddRoutesForConnection(&manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 	assert.NoError(t, err)
 
